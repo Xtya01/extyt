@@ -1,1 +1,3 @@
-module yt-extractor go 1.22
+module yt-extractor
+
+go 1.22
