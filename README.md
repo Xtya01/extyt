@@ -1,22 +1,26 @@
-# extyt - Fixed for Koyeb
+# v6 - Telegram JSON DB (512 MB Nano friendly)
 
-Ye wala version Koyeb par build fail nahi hoga.
+Isme 2 cheez Telegram pe hai:
+1. Gaane (audio files)
+2. db.json (index)
 
-### Koyeb par kaise fix kare (tere screenshot wala error)
-1. Koyeb Dashboard > gay-harrietta/extyt > Settings pe ja
-2. Builder ko "Dockerfile" select kar (Buildpack nahi)
-3. Dockerfile location: /Dockerfile
-4. Port: 8000
+Koyeb free me disk udd jata hai, isliye DB bhi Telegram pe backup hota hai.
 
-5. Ab naya zip wala code GitHub pe push kar:
-   git add .
-   git commit -m "fix koyeb build"
-   git push
+### ENV vars Koyeb pe:
+BOT_TOKEN=123:AAHxxx (BotFather se)
+CHANNEL_ID=-100xxxx (jaha gaane save honge)
+DB_JSON_FILE_ID= (optional) pehle backup ka file_id, restore ke liye
 
-6. Fir Koyeb pe Redeploy dabaa
+### Flow:
+- /play?url=YT_URL -> pehli baar YT se download -> Telegram pe upload -> db.json me entry + db.json ka backup Telegram pe
+- Dusri baar -> db.json me file_id mil gaya -> direct Telegram se redirect, YT touch nahi, RAM 25 MB
 
-Logs dekhne ke liye: View latest deployment > Build logs
+- /list -> saare gaane ka JSON index dekho
+- /db -> db.json download karo
+- /health -> kitne gaane indexed hai
 
-### Test
-https://gay-harrietta-zill-e7f795ba.koyeb.app/
-https://gay-harrietta-zill-e7f795ba.koyeb.app/convert?url=YOUR_OWN_YT_URL
+### Telegram se DB restore kaise hota hai?
+Koyeb sleep hoke uthega to /tmp/db.json gayab. Agar DB_JSON_FILE_ID ENV me hai to app boot pe Telegram se db.json download karke restore kar lega. Naya backup banta hai to log me file_id dikhega, usko ENV me update kar do.
+
+### Cookies:
+cookies.txt ko base64 karke YT_COOKIES_B64 ENV me daalo, ya file ke roop me repo me daalo.
