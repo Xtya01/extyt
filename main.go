@@ -9,37 +9,48 @@ import (
 	"path/filepath"
 )
 
-func runFFmpeg(args...string) error {
+func runFFmpeg(args...string) (string, error) {
 	cmd := exec.Command("ffmpeg", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	log.Println("Running:", cmd.String())
-	return cmd.Run()
+	out, err := cmd.CombinedOutput()
+	log.Printf("ffmpeg out: %s", string(out))
+	return string(out), err
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("OK - extyt running"))
+	w.Write([]byte("OK - extyt running v3"))
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
 	ytUrl := r.URL.Query().Get("url")
 	if ytUrl == "" {
 		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte("Use: /convert?url=YOUTUBE_URL\nExample: /convert?url=https://www.youtube.com/watch?v=BaW_jenozKc"))
+		w.Write([]byte("Use: /convert?url=YOUTUBE_URL"))
 		return
 	}
 
 	tmpDir := "/tmp"
-	id := fmt.Sprintf("%d-%d", os.Getpid(), os.Getuid())
+	id := fmt.Sprintf("%d", os.Getpid())
+	// yt-dlp ke liye template
 	inputTemplate := filepath.Join(tmpDir, id+"_%(title)s.%(ext)s")
 	outputMp3 := filepath.Join(tmpDir, id+"_output.mp3")
 
 	log.Println("Downloading:", ytUrl)
-	dlCmd := exec.Command("yt-dlp", "-x", "--audio-format", "mp3", "-o", inputTemplate, ytUrl)
-	dlCmd.Stdout = os.Stdout
-	dlCmd.Stderr = os.Stderr
-	if err := dlCmd.Run(); err != nil {
-		http.Error(w, "yt-dlp failed: "+err.Error(), 500)
+	// Fix 1: latest client spoof - YouTube ne web client block kiya hua hai
+	// android client + web fallback sabse stable hai 2024-2026 me
+	ytDlpArgs := []string{
+		"-x", "--audio-format", "mp3",
+		"--no-playlist",
+		"--no-check-certificate",
+		"--extractor-args", "youtube:player_client=android,web",
+		"--user-agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36",
+		"-o", inputTemplate,
+		ytUrl,
+	}
+	cmd := exec.Command("yt-dlp", ytDlpArgs...)
+	out, err := cmd.CombinedOutput()
+	log.Printf("yt-dlp output: %s", string(out))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("yt-dlp failed: %v\n\nFull Log:\n%s", err, string(out)), 500)
 		return
 	}
 
@@ -51,12 +62,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		matches = append(m1, m2...)
 		matches = append(matches, m3...)
 		if len(matches) == 0 {
-			http.Error(w, "downloaded file not found", 500)
+			http.Error(w, fmt.Sprintf("File not found after download. yt-dlp log:\n%s", string(out)), 500)
 			return
 		}
 	}
 	inputFile := matches[0]
-	log.Println("Input file:", inputFile)
 
 	start := r.URL.Query().Get("start")
 	duration := r.URL.Query().Get("duration")
@@ -70,8 +80,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(args, "-i", inputFile, "-c:a", "libmp3lame", "-b:a", "192k", "-filter:a", "loudnorm", "-y", outputMp3)
 
-	if err := runFFmpeg(args...); err != nil {
-		http.Error(w, "ffmpeg failed: "+err.Error(), 500)
+	ffmpegLog, err := runFFmpeg(args...)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("ffmpeg failed: %v\nLog: %s", err, ffmpegLog), 500)
 		return
 	}
 
