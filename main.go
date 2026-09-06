@@ -215,7 +215,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	os.Remove(tmpFile)
 
 	cookieArgs := getCookiesArg()
-	ytArgs := []string{"-x", "--audio-format", "mp3", "--no-playlist", "--no-check-certificate", "--extractor-args", "youtube:player_client=android,web", "--user-agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36", "-o", tmpFile}
+	ytArgs := []string{"-x", "--audio-format", "mp3", "--no-playlist", "--no-check-certificate", "--js-runtimes", "node:deno", "--extractor-args", "youtube:player_client=web", "-o", tmpFile}
 	ytArgs = append(cookieArgs, ytArgs...)
 	ytArgs = append(ytArgs, ytUrl)
 
