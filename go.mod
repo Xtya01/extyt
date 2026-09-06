@@ -1,2 +1,3 @@
-module koyeb-yt-ffmpeg
+module extyt
+
 go 1.22
