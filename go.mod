@@ -1,3 +1,2 @@
-module yt-extractor
-
+module koyeb-yt-ffmpeg
 go 1.22
