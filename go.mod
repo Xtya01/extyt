@@ -1,3 +1,2 @@
-module extyt
-
-go 1.22
+module yt-bot
+go 1.21
