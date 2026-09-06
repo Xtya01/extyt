@@ -1,139 +1,83 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"sync"
-	"time"
+	"os/exec"
+	"path/filepath"
 )
 
-var cache sync.Map
-
-type cacheVal struct {
-	URL   string `json:"url"`
-	Title string `json:"title"`
+func runFFmpeg(args...string) error {
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	log.Println("Running:", cmd.String())
+	return cmd.Run()
 }
 
-func getDirectURL(videoId string) (cacheVal, error) {
-	if v, ok := cache.Load(videoId); ok {
-		return v.(cacheVal), nil
-	}
-
-	// ANDROID_MUSIC client - sabse halka, Vercel jaisa IP block nahi
-	payload := map[string]interface{}{
-		"context": map[string]interface{}{
-			"client": map[string]string{
-				"clientName":    "ANDROID_MUSIC",
-				"clientVersion": "6.20",
-			},
-		},
-		"videoId": videoId,
-	}
-	b, _ := json.Marshal(payload)
-
-	req, _ := http.NewRequest("POST", "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8", bytes.NewReader(b))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "com.google.android.apps.youtube.music/6.20")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return cacheVal{}, err
-	}
-	defer resp.Body.Close()
-
-	var data map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return cacheVal{}, err
-	}
-
-	// streamingData -> adaptiveFormats me audio hota hai
-	sd, ok := data["streamingData"].(map[string]interface{})
-	if !ok {
-		return cacheVal{}, fmt.Errorf("no streamingData - video blocked or private")
-	}
-	af, ok := sd["adaptiveFormats"].([]interface{})
-	if !ok {
-		return cacheVal{}, fmt.Errorf("no formats")
-	}
-
-	var bestURL string
-	// itag 140 = m4a 128k best for low cpu
-	for _, f := range af {
-		fm := f.(map[string]interface{})
-		if itag, ok := fm["itag"].(float64); ok && itag == 140 {
-			if u, ok := fm["url"].(string); ok {
-				bestURL = u
-				break
-			}
-		}
-	}
-	if bestURL == "" {
-		// fallback koi bhi audio
-		for _, f := range af {
-			fm := f.(map[string]interface{})
-			if mime, ok := fm["mimeType"].(string); ok && len(mime) > 5 && mime[:5] == "audio" {
-				if u, ok := fm["url"].(string); ok {
-					bestURL = u
-					break
-				}
-			}
-		}
-	}
-	if bestURL == "" {
-		return cacheVal{}, fmt.Errorf("no audio url found")
-	}
-
-	title := ""
-	if vd, ok := data["videoDetails"].(map[string]interface{}); ok {
-		if t, ok := vd["title"].(string); ok {
-			title = t
-		}
-	}
-
-	val := cacheVal{URL: bestURL, Title: title}
-	cache.Store(videoId, val)
-	return val, nil
-}
-
-func extractHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Content-Type", "application/json")
-
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "id missing, use ?id=VIDEO_ID"})
+func handler(w http.ResponseWriter, r *http.Request) {
+	ytUrl := r.URL.Query().Get("url")
+	if ytUrl == "" {
+		w.Write([]byte("use: /convert?url=YOUTUBE_URL"))
 		return
 	}
 
-	result, err := getDirectURL(id)
-	if err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	tmpDir := "/tmp"
+	id := fmt.Sprintf("%d", os.Getpid())
+	inputTemplate := filepath.Join(tmpDir, id+"_%(title)s.%(ext)s")
+	outputMp3 := filepath.Join(tmpDir, id+"_output.mp3")
+
+	// Step 1: yt-dlp se audio nikalo - apne khud ke video / no-copyright ke liye
+	// yt-dlp -x --audio-format mp3 -o "/tmp/..." URL
+	dlCmd := exec.Command("yt-dlp", "-x", "--audio-format", "mp3", "-o", inputTemplate, ytUrl)
+	dlCmd.Stdout = os.Stdout
+	dlCmd.Stderr = os.Stderr
+	if err := dlCmd.Run(); err!= nil {
+		http.Error(w, "yt-dlp failed: "+err.Error(), 500)
 		return
 	}
-	json.NewEncoder(w).Encode(result)
+
+	// Step 2: ffmpeg se trim / normalize - 4.5 min ka gaana kaatna hai to?start=30&duration=270
+	start := r.URL.Query().Get("start") // e.g. 30
+	duration := r.URL.Query().Get("duration") // e.g. 270 for 4.5 min
+
+	// input file dhundo
+	matches, _ := filepath.Glob(filepath.Join(tmpDir, id+"_*.mp3"))
+	if len(matches) == 0 {
+		http.Error(w, "downloaded file not found", 500)
+		return
+	}
+	inputFile := matches[0]
+
+	args := []string{}
+	if start!= "" {
+		args = append(args, "-ss", start)
+	}
+	if duration!= "" {
+		args = append(args, "-t", duration)
+	}
+	args = append(args, "-i", inputFile, "-c:a", "libmp3lame", "-b:a", "192k", "-filter:a", "loudnorm", outputMp3)
+
+	if err := runFFmpeg(args...); err!= nil {
+		http.Error(w, "ffmpeg failed: "+err.Error(), 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Content-Disposition", "attachment; filename=song.mp3")
+	http.ServeFile(w, r, outputMp3)
 }
 
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8000" // Koyeb default
+		port = "8000"
 	}
-	http.HandleFunc("/api/extract", extractHandler)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "Go extractor running - RAM <15MB",
-			"usage":  "/api/extract?id=VIDEO_ID",
-		})
-	})
+	http.HandleFunc("/", handler)
+	http.HandleFunc("/convert", handler)
 
-	log.Printf("Extractor running on :%s - RAM <15MB", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Println("Listening on 0.0.0.0:" + port)
+	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, nil))
 }
