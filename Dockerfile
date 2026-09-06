@@ -1,16 +1,17 @@
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum* ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o server .
+FROM python:3.11-slim
 
-FROM alpine:3.19
-RUN apk add --no-cache ffmpeg python3 py3-pip
-RUN pip3 install --break-system-packages --no-cache-dir -U yt-dlp
+RUN apt-get update && apt-get install -y ffmpeg curl nodejs npm && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deno.land/install.sh | sh
+ENV DENO_INSTALL="/root/.deno"
+ENV PATH="$DENO_INSTALL/bin:$PATH"
+
+RUN node --version && deno --version
+
 WORKDIR /app
-COPY --from=builder /app/server .
-COPY cookies.txt* ./
+COPY requirements.txt.
+RUN pip install --no-cache-dir -U pip && pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir -U yt-dlp
+COPY..
 ENV PORT=8000
 EXPOSE 8000
-CMD ["./server"]
+CMD ["python", "main.py"]
