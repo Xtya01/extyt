@@ -23,17 +23,12 @@ type cacheVal struct {
 	Title string `json:"title"`
 }
 
-func tryClient(videoId, clientName, clientVersion, userAgent string, extra map[string]interface{}) (cacheVal, error) {
-	clientMap := map[string]interface{}{"clientName": clientName, "clientVersion": clientVersion}
-	for k,v := range extra { clientMap[k]=v }
+func tryClient(videoId, clientName, clientVersion, userAgent string) (cacheVal, error) {
 	payload := map[string]interface{}{
 		"context": map[string]interface{}{
-			"client": clientMap,
-			"thirdParty": map[string]interface{}{"embedUrl": fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoId)},
+			"client": map[string]string{"clientName": clientName, "clientVersion": clientVersion},
 		},
 		"videoId": videoId,
-		"contentCheckOk": true,
-		"racyCheckOk": true,
 	}
 	b,_:=json.Marshal(payload)
 	req,_:=http.NewRequest("POST","https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8", bytes.NewReader(b))
@@ -45,81 +40,42 @@ func tryClient(videoId, clientName, clientVersion, userAgent string, extra map[s
 	defer resp.Body.Close()
 	var data map[string]interface{}
 	if err:=json.NewDecoder(resp.Body).Decode(&data); err!=nil { return cacheVal{}, err }
-	if ps,ok:=data["playabilityStatus"].(map[string]interface{}); ok {
-		if status,ok:=ps["status"].(string); ok && status!="OK" {
-			reason,_:=ps["reason"].(string)
-			if _,has:=data["streamingData"]; !has {
-				return cacheVal{}, fmt.Errorf("%s: %s (%s)", clientName, status, reason)
-			}
-		}
-	}
 	sd,ok:=data["streamingData"].(map[string]interface{})
 	if !ok { return cacheVal{}, fmt.Errorf("no streamingData with %s", clientName) }
 	af,ok:=sd["adaptiveFormats"].([]interface{})
-	if !ok { if f,ok:=sd["formats"].([]interface{}); ok { af=f } else { return cacheVal{}, fmt.Errorf("no formats with %s", clientName) } }
+	if !ok { return cacheVal{}, fmt.Errorf("no formats") }
 	var best string
 	for _,f:=range af {
-		fm,ok:=f.(map[string]interface{})
-		if !ok { continue }
+		fm:=f.(map[string]interface{})
 		if itag,ok:=fm["itag"].(float64); ok && itag==140 {
-			if u,ok:=fm["url"].(string); ok && u!="" { best=u; break }
+			if u,ok:=fm["url"].(string); ok { best=u; break }
 		}
 	}
 	if best=="" {
 		for _,f:=range af {
-			fm,ok:=f.(map[string]interface{})
-			if !ok { continue }
+			fm:=f.(map[string]interface{})
 			if mime,ok:=fm["mimeType"].(string); ok && len(mime)>=5 && mime[:5]=="audio" {
-				if u,ok:=fm["url"].(string); ok && u!="" { best=u; break }
+				if u,ok:=fm["url"].(string); ok { best=u; break }
 			}
 		}
 	}
-	if best=="" { return cacheVal{}, fmt.Errorf("no audio with %s", clientName) }
+	if best=="" { return cacheVal{}, fmt.Errorf("no audio") }
 	title:=""
 	if vd,ok:=data["videoDetails"].(map[string]interface{}); ok { if t,ok:=vd["title"].(string); ok { title=t } }
 	return cacheVal{URL: best, Title: title}, nil
 }
 
-func tryScrape(videoId string) (cacheVal, error) {
-	url := fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoId)
-	req,_:=http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept-Language","en-US,en;q=0.9")
-	client:=&http.Client{Timeout:15*time.Second}
-	resp,err:=client.Do(req)
-	if err!=nil { return cacheVal{}, err }
-	defer resp.Body.Close()
-	bodyBytes,_:=io.ReadAll(resp.Body)
-	body:=string(bodyBytes)
-	reUrl := regexp.MustCompile(`"url":"(https:\\/\\/[^"]+googlevideo[^"]+)"`)
-	urls := reUrl.FindAllStringSubmatch(body, 20)
-	for _,m:=range urls {
-		if len(m)>=2 {
-			raw := strings.ReplaceAll(m[1], `\/`, "/")
-			raw = strings.ReplaceAll(raw, `&`, "&")
-			if strings.Contains(raw, "mime=audio") || strings.Contains(raw, "itag=140") || strings.Contains(raw, "itag=139") {
-				return cacheVal{URL: raw, Title: "scraped"}, nil
-			}
-		}
-	}
-	if len(urls)>0 {
-		raw := strings.ReplaceAll(urls[0][1], `\/`, "/")
-		raw = strings.ReplaceAll(raw, `&`, "&")
-		return cacheVal{URL: raw, Title: "scraped"}, nil
-	}
-	return cacheVal{}, fmt.Errorf("scrape no url")
-}
-
 func tryYtDlp(videoId string) (cacheVal, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// FIXED: use universal format, no restrictive 140, no extractor-args
+	// yt-dlp will auto pick best client
 	cmd := exec.CommandContext(ctx, "yt-dlp",
 		"--no-playlist",
 		"--no-warnings",
-		"--no-check-certificate",
-		"--extractor-args", "youtube:player_client=android_music,web",
-		"-f", "140/bestaudio[ext=m4a]/bestaudio/best",
+		"-f", "bestaudio/best",
 		"--get-url",
+		"--no-check-certificate",
 		fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoId),
 	)
 	var out bytes.Buffer
@@ -130,39 +86,64 @@ func tryYtDlp(videoId string) (cacheVal, error) {
 	if err!=nil {
 		return cacheVal{}, fmt.Errorf("yt-dlp failed: %v | stderr: %s", err, errBuf.String())
 	}
-	url := strings.TrimSpace(out.String())
-	lines := strings.Split(url, "\n")
-	first := strings.TrimSpace(lines[0])
-	if !strings.HasPrefix(first, "http") {
-		return cacheVal{}, fmt.Errorf("yt-dlp invalid url: %s", first)
+	urlStr := strings.TrimSpace(out.String())
+	lines := strings.Split(urlStr, "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "http") {
+			return cacheVal{URL: l, Title: "yt-dlp"}, nil
+		}
 	}
-	return cacheVal{URL: first, Title: "yt-dlp"}, nil
+	return cacheVal{}, fmt.Errorf("yt-dlp empty")
+}
+
+func tryPiped(videoId string) (cacheVal, error) {
+	bases := []string{"https://pipedapi.kavin.rocks","https://pipedapi.moomoo.me"}
+	for _, base := range bases {
+		url := fmt.Sprintf("%s/streams/%s", base, videoId)
+		client:=&http.Client{Timeout:10*time.Second}
+		resp,err:=client.Get(url)
+		if err!=nil { continue }
+		if resp.StatusCode!=200 { resp.Body.Close(); continue }
+		var data map[string]interface{}
+		if err:=json.NewDecoder(resp.Body).Decode(&data); err!=nil { resp.Body.Close(); continue }
+		resp.Body.Close()
+		if audios,ok:=data["audioStreams"].([]interface{}); ok && len(audios)>0 {
+			if am,ok:=audios[0].(map[string]interface{}); ok {
+				if u,ok:=am["url"].(string); ok {
+					title,_:=data["title"].(string)
+					return cacheVal{URL: u, Title: title}, nil
+				}
+			}
+		}
+	}
+	return cacheVal{}, fmt.Errorf("piped failed")
 }
 
 func getDirectURL(videoId string) (cacheVal, error) {
 	if v,ok:=cache.Load(videoId); ok { return v.(cacheVal), nil }
-	clients := []struct{Name, Version, UA string; Extra map[string]interface{}}{
-		{"ANDROID_MUSIC","6.20","com.google.android.apps.youtube.music/6.20", map[string]interface{}{"androidSdkVersion":30}},
-		{"ANDROID","19.09.37","com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip", map[string]interface{}{"osName":"Android","osVersion":"11","androidSdkVersion":30}},
-		{"IOS","19.09.3","com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)", map[string]interface{}{"osName":"iOS","osVersion":"15.6.0.19G71"}},
+
+	// try simple clients first (fast)
+	for _, c := range []struct{Name,Ver,UA string}{
+		{"ANDROID_MUSIC","6.20","com.google.android.apps.youtube.music/6.20"},
+		{"ANDROID","19.09.37","com.google.android.youtube/19.09.37 (Linux; U; Android 11)"},
+	} {
+		if val,err:=tryClient(videoId,c.Name,c.Ver,c.UA); err==nil {
+			cache.Store(videoId,val); return val,nil
+		}
 	}
-	var lastErr error
-	for _,c:=range clients {
-		val,err:=tryClient(videoId, c.Name, c.Version, c.UA, c.Extra)
-		if err==nil { cache.Store(videoId,val); return val,nil }
-		lastErr=err
-		log.Printf("client %s failed: %v", c.Name, err)
-	}
-	if val,err:=tryScrape(videoId); err==nil {
-		cache.Store(videoId,val)
-		return val,nil
-	} else { log.Printf("scrape failed: %v", err); lastErr=err }
+
+	// yt-dlp final (most reliable)
 	if val,err:=tryYtDlp(videoId); err==nil {
-		log.Printf("yt-dlp success for %s", videoId)
-		cache.Store(videoId,val)
-		return val,nil
-	} else { log.Printf("yt-dlp failed: %v", err); lastErr=err }
-	return cacheVal{}, lastErr
+		cache.Store(videoId,val); return val,nil
+	} else {
+		log.Printf("yt-dlp failed: %v", err)
+		// fallback piped
+		if val2,err2:=tryPiped(videoId); err2==nil {
+			cache.Store(videoId,val2); return val2,nil
+		}
+		return cacheVal{}, err
+	}
 }
 
 func extractHandler(w http.ResponseWriter, r *http.Request) {
@@ -181,8 +162,8 @@ func main() {
 	http.HandleFunc("/api/extract", extractHandler)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request){
 		w.Header().Set("Content-Type","application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status":"Go+yt-dlp v6 - final","usage":"/api/extract?id=VIDEO_ID"})
+		json.NewEncoder(w).Encode(map[string]string{"status":"Go+yt-dlp v7 fixed format","usage":"/api/extract?id=VIDEO_ID"})
 	})
-	log.Printf("Extractor v6 (yt-dlp) running on :%s", port)
+	log.Printf("Extractor v7 running on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
