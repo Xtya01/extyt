@@ -2,15 +2,12 @@ FROM golang:1.21-bookworm
 
 RUN apt-get update && apt-get install -y ffmpeg curl nodejs npm python3-pip unzip && rm -rf /var/lib/apt/lists/*
 
-# pip se yt-dlp - binary se zyada stable hai JS runtime ke liye
 RUN pip3 install --break-system-packages -U yt-dlp
 
-# Deno - yt-dlp isko sabse pehle prefer karta hai n challenge ke liye
 RUN curl -fsSL https://deno.land/install.sh | sh
 ENV DENO_INSTALL="/root/.deno"
 ENV PATH="/root/.deno/bin:/usr/local/bin:/usr/bin:$PATH"
 
-# Debian me kabhi node ka naam nodejs hota hai - uska symlink fix
 RUN ln -sf /usr/bin/nodejs /usr/bin/node || true && ln -sf /usr/bin/node /usr/local/bin/node || true
 
 RUN node --version && deno --version && yt-dlp --version
