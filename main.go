@@ -82,7 +82,7 @@ func backupDBToTelegram() {
 	part, _ := writer.CreateFormFile("document", "db.json")
 	io.Copy(part, file)
 	writer.WriteField("chat_id", chatID)
-	writer.WriteField("caption", fmt.Sprintf("DB backup %s - %d songs", time.Now().Format("2006-01-02 15:04"), len(db)))
+	writer.WriteField("caption", fmt.Sprintf("DB backup %s - %d songs - file_id ko ENV DB_JSON_FILE_ID me daalo", time.Now().Format("2006-01-02 15:04"), len(db)))
 	writer.Close()
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", token)
 	req, _ := http.NewRequest("POST", url, body)
@@ -175,12 +175,6 @@ func getCookiesArg() []string {
 	return []string{}
 }
 
-func enableCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "*")
-}
-
 func isSubsonicAuthOK(r *http.Request) bool {
 	user := os.Getenv("SUBSONIC_USER")
 	pass := os.Getenv("SUBSONIC_PASS")
@@ -212,12 +206,13 @@ func isSubsonicAuthOK(r *http.Request) bool {
 
 func subsonicBase() map[string]interface{} {
 	return map[string]interface{}{
-		"status": "ok", "version": "1.16.1", "type": "extyt", "serverVersion": "v12.1-single-login", "openSubsonic": true,
+		"status": "ok", "version": "1.16.1", "type": "extyt", "serverVersion": "v10-m4a-subsonic", "openSubsonic": true,
 	}
 }
 
 func sendSubsonic(w http.ResponseWriter, r *http.Request, jsonExtra map[string]interface{}, xmlInner string) {
-	enableCORS(w)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 	if !isSubsonicAuthOK(r) {
 		if r.URL.Query().Get("f") == "json" {
 			w.Header().Set("Content-Type", "application/json")
@@ -238,12 +233,11 @@ func sendSubsonic(w http.ResponseWriter, r *http.Request, jsonExtra map[string]i
 		return
 	}
 	w.Header().Set("Content-Type", "text/xml")
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="extyt" serverVersion="v12.1-single-login" openSubsonic="true">%s</subsonic-response>`, xmlInner)
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="extyt" serverVersion="v10-m4a-subsonic" openSubsonic="true">%s</subsonic-response>`, xmlInner)
 }
 
 func xmlEscape(s string) string {
-	r := strings.NewReplacer("&", "&amp;", "\"", "&quot;", "'", "&apos;", "<", "&lt;", ">", "&gt;")
-	return r.Replace(s)
+	return strings.NewReplacer("&", "&amp;", """, "&quot;", "'", "&apos;", "<", "&lt;", ">", "&gt;").Replace(s)
 }
 
 func songToChild(s Song, idx int) (map[string]interface{}, string) {
@@ -286,6 +280,7 @@ func songToSong(s Song, idx int) (map[string]interface{}, string) {
 	return j, x
 }
 
+
 func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
 	if r.Method == "OPTIONS" {
@@ -307,17 +302,43 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 	case "ping":
 		sendSubsonic(w, r, map[string]interface{}{}, "")
 	case "getlicense":
-		sendSubsonic(w, r, map[string]interface{}{"license": map[string]interface{}{"valid": true, "email": "extyt@submuz.local"}}, `<license valid="true" email="extyt@submuz.local"/>`)
+		sendSubsonic(w, r, map[string]interface{}{"license": map[string]interface{}{"valid": true, "email": "extyt@submuz.local", "licenseExpires": "2029-09-11T19:00:00"}}, `<license valid="true" email="extyt@submuz.local"/>`)
+	case "getopensubsonicextensions":
+		sendSubsonic(w, r, map[string]interface{}{"openSubsonicExtensions": map[string]interface{}{"extension": []map[string]interface{}{{"name": "transcode", "versions": []int{1}}, {"name": "formPost", "versions": []int{1}}, {"name": "songLyrics", "versions": []int{1}} }}}, `<openSubsonicExtensions><extension name="transcode" versions="1"/><extension name="formPost" versions="1"/><extension name="songLyrics" versions="1"/></openSubsonicExtensions>`)
 	case "getmusicfolders":
 		sendSubsonic(w, r, map[string]interface{}{"musicFolders": map[string]interface{}{"musicFolder": []map[string]interface{}{{"id": 0, "name": "Music"}, {"id": 1, "name": "Submuz"}}}}, `<musicFolders><musicFolder id="0" name="Music"/><musicFolder id="1" name="Submuz"/></musicFolders>`)
+	case "getuser":
+		u := os.Getenv("SUBSONIC_USER")
+		if u == "" { u = os.Getenv("ADMIN_USER") }
+		if u == "" { u = "admin" }
+		sendSubsonic(w, r, map[string]interface{}{"user": map[string]interface{}{"username": u, "email": "admin@submuz.local", "scrobblingEnabled": false, "adminRole": true, "settingsRole": true, "downloadRole": true, "uploadRole": true, "playlistRole": true, "coverArtRole": true, "commentRole": false, "podcastRole": false, "streamRole": true, "jukeboxRole": false, "shareRole": true, "videoConversionRole": false, "avatarLastChanged": "2024-01-01T00:00:00.000Z", "folder": []int{0,1}}}, fmt.Sprintf(`<user username="%s" adminRole="true" scrobblingEnabled="false"><folder>0</folder><folder>1</folder></user>`, xmlEscape(u)))
+	case "getusers":
+		u := os.Getenv("SUBSONIC_USER")
+		if u == "" { u = "admin" }
+		sendSubsonic(w, r, map[string]interface{}{"users": map[string]interface{}{"user": []map[string]interface{}{{"username": u, "adminRole": true}}}}, fmt.Sprintf(`<users><user username="%s" adminRole="true"/></users>`, xmlEscape(u)))
 	case "getindexes", "getartists":
+		// Group by first letter
 		sendSubsonic(w, r, map[string]interface{}{
-			"artists": map[string]interface{}{"index": []map[string]interface{}{{"name": "Y", "artist": []map[string]interface{}{{"id": "1", "name": "YouTube", "albumCount": 1}}}}},
-			"indexes": map[string]interface{}{"index": []map[string]interface{}{{"name": "Y", "artist": []map[string]interface{}{{"id": "1", "name": "YouTube"}}}}, "lastModified": 0},
-		}, `<indexes><index name="Y"><artist id="1" name="YouTube"/></index></indexes>`)
+			"artists": map[string]interface{}{"index": []map[string]interface{}{{"name": "Y", "artist": []map[string]interface{}{{"id": "1", "name": "YouTube", "albumCount": 1, "coverArt": "1"}}}}},
+			"indexes": map[string]interface{}{"index": []map[string]interface{}{{"name": "Y", "artist": []map[string]interface{}{{"id": "1", "name": "YouTube", "albumCount": 1}}}}, "lastModified": time.Now().UnixMilli()},
+		}, `<indexes lastModified="0"><index name="Y"><artist id="1" name="YouTube" albumCount="1"/></index></indexes>`)
 	case "getartist":
-		sendSubsonic(w, r, map[string]interface{}{"artist": map[string]interface{}{"id": "1", "name": "YouTube", "albumCount": 1, "album": []map[string]interface{}{{"id": "1", "name": "Submuz", "artist": "YouTube", "songCount": len(songs)}}}}, fmt.Sprintf(`<artist id="1" name="YouTube"><album id="1" name="Submuz" songCount="%d"/></artist>`, len(songs)))
-	case "getalbum", "getmusicdirectory":
+		sendSubsonic(w, r, map[string]interface{}{"artist": map[string]interface{}{"id": "1", "name": "YouTube", "albumCount": 1, "coverArt": "1", "album": []map[string]interface{}{{"id": "1", "name": "Submuz", "artist": "YouTube", "songCount": len(songs), "coverArt": "1", "created": time.Now().Format(time.RFC3339)}}}}, fmt.Sprintf(`<artist id="1" name="YouTube" albumCount="1"><album id="1" name="Submuz" songCount="%d"/></artist>`, len(songs)))
+	case "getartistinfo", "getartistinfo2":
+		// Amcfy expects biography, similar artists etc - return empty but valid
+		sendSubsonic(w, r, map[string]interface{}{"artistInfo": map[string]interface{}{"biography": "YouTube music collection", "musicBrainzId": "", "lastFmUrl": "", "smallImageUrl": "", "mediumImageUrl": "", "largeImageUrl": ""}, "artistInfo2": map[string]interface{}{"biography": "YouTube music collection", "smallImageUrl": "", "mediumImageUrl": "", "largeImageUrl": ""}}, `<artistInfo><biography>YouTube collection</biography></artistInfo>`)
+	case "getalbum":
+		var sx strings.Builder
+		var sj []map[string]interface{}
+		for i, s := range songs {
+			j, x := songToSong(s, i)
+			sj = append(sj, j)
+			sx.WriteString(x)
+		}
+		sendSubsonic(w, r, map[string]interface{}{"album": map[string]interface{}{"id": "1", "name": "Submuz", "artist": "YouTube", "artistId": "1", "coverArt": "1", "songCount": len(songs), "duration": len(songs)*210, "created": time.Now().Format(time.RFC3339), "year": 2025, "genre": "YouTube", "song": sj}}, fmt.Sprintf(`<album id="1" name="Submuz" artist="YouTube" songCount="%d" duration="%d">%s</album>`, len(songs), len(songs)*210, sx.String()))
+	case "getalbuminfo", "getalbuminfo2":
+		sendSubsonic(w, r, map[string]interface{}{"albumInfo": map[string]interface{}{"notes": "Submuz collection", "musicBrainzId": "", "lastFmUrl": "", "smallImageUrl": "", "mediumImageUrl": "", "largeImageUrl": ""}, "albumInfo2": map[string]interface{}{"notes": "Submuz collection"}}, `<albumInfo><notes>Submuz collection</notes></albumInfo>`)
+	case "getmusicdirectory":
 		var xmlChildren strings.Builder
 		var jsonChildren []map[string]interface{}
 		for i, s := range songs {
@@ -328,27 +349,46 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			_, x := songToChild(s, i)
 			xmlChildren.WriteString(x)
 		}
-		if endpoint == "getmusicdirectory" {
-			sendSubsonic(w, r, map[string]interface{}{"directory": map[string]interface{}{"id": "1", "name": "Submuz", "childCount": len(songs), "child": jsonChildren}}, fmt.Sprintf(`<directory id="1" name="Submuz" childCount="%d">%s</directory>`, len(songs), xmlChildren.String()))
-		} else {
-			var sx strings.Builder
-			var sj []map[string]interface{}
-			for i, s := range songs {
-				j, x := songToSong(s, i)
-				sj = append(sj, j)
-				sx.WriteString(x)
-			}
-			sendSubsonic(w, r, map[string]interface{}{"album": map[string]interface{}{"id": "1", "name": "Submuz", "artist": "YouTube", "songCount": len(songs), "song": sj}}, fmt.Sprintf(`<album id="1" name="Submuz" songCount="%d">%s</album>`, len(songs), sx.String()))
+		sendSubsonic(w, r, map[string]interface{}{"directory": map[string]interface{}{"id": "1", "name": "Submuz", "childCount": len(songs), "child": jsonChildren}}, fmt.Sprintf(`<directory id="1" name="Submuz" childCount="%d">%s</directory>`, len(songs), xmlChildren.String()))
+	case "getgenres":
+		sendSubsonic(w, r, map[string]interface{}{"genres": map[string]interface{}{"genre": []map[string]interface{}{{"value": "YouTube", "songCount": len(songs), "albumCount": 1}, {"value": "Music", "songCount": len(songs), "albumCount": 1}}}}, fmt.Sprintf(`<genres><genre songCount="%d" albumCount="1">YouTube</genre></genres>`, len(songs)))
+	case "getsong":
+		id := r.URL.Query().Get("id")
+		cleanID := id
+		if strings.Contains(id, "-") {
+			parts := strings.Split(id, "-")
+			cleanID = parts[len(parts)-1]
 		}
+		var found *Song
+		for _, s := range songs {
+			if s.YTID == cleanID || s.YTID == id {
+				tmp := s
+				found = &tmp
+				break
+			}
+		}
+		if found == nil && len(songs) > 0 {
+			tmp := songs[0]
+			found = &tmp
+		}
+		if found != nil {
+			j, x := songToSong(*found, 0)
+			sendSubsonic(w, r, map[string]interface{}{"song": j}, x)
+		} else {
+			sendSubsonic(w, r, map[string]interface{}{}, "")
+		}
+	case "getvideos":
+		sendSubsonic(w, r, map[string]interface{}{"videos": map[string]interface{}{"video": []interface{}{}}}, `<videos/>`)
 	case "getalbumlist", "getalbumlist2":
-		albumJSON := map[string]interface{}{"id": "1", "title": "Submuz", "name": "Submuz", "artist": "YouTube", "songCount": len(songs), "coverArt": "1"}
+		// Support types: random, recent, frequent, starred, alphabeticalByName, etc
+		typ := r.URL.Query().Get("type")
+		if typ == "" { typ = "random" }
+		albumJSON := map[string]interface{}{"id": "1", "title": "Submuz", "name": "Submuz", "artist": "YouTube", "artistId": "1", "songCount": len(songs), "coverArt": "1", "created": time.Now().Format(time.RFC3339), "duration": len(songs)*210}
 		sendSubsonic(w, r, map[string]interface{}{"albumList": map[string]interface{}{"album": []map[string]interface{}{albumJSON}}, "albumList2": map[string]interface{}{"album": []map[string]interface{}{albumJSON}}}, fmt.Sprintf(`<albumList><album id="1" title="Submuz" songCount="%d"/></albumList>`, len(songs)))
-	case "getrandomsongs", "getstarred", "getstarred2", "getsongsbygenre":
+	case "getrandomsongs":
 		rand.Shuffle(len(songs), func(i, j int) { songs[i], songs[j] = songs[j], songs[i] })
 		limit := 50
-		if len(songs) < limit {
-			limit = len(songs)
-		}
+		if len(songs) < limit { limit = len(songs) }
 		var xb strings.Builder
 		var ja []map[string]interface{}
 		for i := 0; i < limit; i++ {
@@ -356,12 +396,49 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			ja = append(ja, j)
 			xb.WriteString(x)
 		}
-		sendSubsonic(w, r, map[string]interface{}{"randomSongs": map[string]interface{}{"song": ja}, "starred": map[string]interface{}{"song": ja}}, fmt.Sprintf(`<randomSongs>%s</randomSongs>`, xb.String()))
+		sendSubsonic(w, r, map[string]interface{}{"randomSongs": map[string]interface{}{"song": ja}}, fmt.Sprintf(`<randomSongs>%s</randomSongs>`, xb.String()))
+	case "getsongsbygenre":
+		genre := r.URL.Query().Get("genre")
+		_ = genre
+		limit := 50
+		if len(songs) < limit { limit = len(songs) }
+		var xb strings.Builder
+		var ja []map[string]interface{}
+		for i := 0; i < limit; i++ {
+			j, x := songToSong(songs[i], i)
+			ja = append(ja, j)
+			xb.WriteString(x)
+		}
+		sendSubsonic(w, r, map[string]interface{}{"songsByGenre": map[string]interface{}{"song": ja}}, fmt.Sprintf(`<songsByGenre>%s</songsByGenre>`, xb.String()))
+	case "getstarred", "getstarred2":
+		// Return all as starred for Amcfy favorites
+		var xb strings.Builder
+		var ja []map[string]interface{}
+		for i, s := range songs {
+			j, x := songToSong(s, i)
+			ja = append(ja, j)
+			xb.WriteString(x)
+		}
+		sendSubsonic(w, r, map[string]interface{}{"starred": map[string]interface{}{"song": ja, "album": []map[string]interface{}{{"id": "1", "name": "Submuz"}}, "artist": []map[string]interface{}{{"id": "1", "name": "YouTube"}}}, "starred2": map[string]interface{}{"song": ja}}, fmt.Sprintf(`<starred>%s</starred>`, xb.String()))
+	case "star", "unstar":
+		// No-op but success
+		sendSubsonic(w, r, map[string]interface{}{}, "")
+	case "getsimilarsongs", "getsimilarsongs2", "gettopsongs":
+		// Return random songs as similar/top
+		rand.Shuffle(len(songs), func(i, j int) { songs[i], songs[j] = songs[j], songs[i] })
+		limit := 20
+		if len(songs) < limit { limit = len(songs) }
+		var xb strings.Builder
+		var ja []map[string]interface{}
+		for i := 0; i < limit; i++ {
+			j, x := songToSong(songs[i], i)
+			ja = append(ja, j)
+			xb.WriteString(x)
+		}
+		sendSubsonic(w, r, map[string]interface{}{"similarSongs": map[string]interface{}{"song": ja}, "similarSongs2": map[string]interface{}{"song": ja}, "topSongs": map[string]interface{}{"song": ja}}, fmt.Sprintf(`<similarSongs>%s</similarSongs>`, xb.String()))
 	case "search", "search2", "search3":
 		q := strings.ToLower(r.URL.Query().Get("query"))
-		if q == "" {
-			q = strings.ToLower(r.URL.Query().Get("q"))
-		}
+		if q == "" { q = strings.ToLower(r.URL.Query().Get("q")) }
 		var matched []Song
 		for _, s := range songs {
 			if q == "" || strings.Contains(strings.ToLower(s.Title), q) || strings.Contains(strings.ToLower(s.YTID), q) {
@@ -375,7 +452,47 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			ja = append(ja, j)
 			xb.WriteString(x)
 		}
-		sendSubsonic(w, r, map[string]interface{}{"searchResult3": map[string]interface{}{"song": ja}}, fmt.Sprintf(`<searchResult3>%s</searchResult3>`, xb.String()))
+		sendSubsonic(w, r, map[string]interface{}{
+			"searchResult": map[string]interface{}{"match": ja},
+			"searchResult2": map[string]interface{}{"song": ja},
+			"searchResult3": map[string]interface{}{"song": ja, "album": []map[string]interface{}{{"id": "1", "name": "Submuz"}}, "artist": []map[string]interface{}{{"id": "1", "name": "YouTube"}}},
+		}, fmt.Sprintf(`<searchResult3><song>%s</song></searchResult3>`, xb.String()))
+	case "getplaylists":
+		sendSubsonic(w, r, map[string]interface{}{"playlists": map[string]interface{}{"playlist": []map[string]interface{}{{"id": "1", "name": "Submuz", "songCount": len(songs), "duration": len(songs)*210, "public": true, "owner": "admin", "created": time.Now().Format(time.RFC3339)}}}}, fmt.Sprintf(`<playlists><playlist id="1" name="Submuz" songCount="%d" duration="%d"/></playlists>`, len(songs), len(songs)*210))
+	case "getplaylist":
+		id := r.URL.Query().Get("id")
+		if id == "" { id = "1" }
+		var xb strings.Builder
+		var ja []map[string]interface{}
+		for i, s := range songs {
+			j, x := songToSong(s, i)
+			ja = append(ja, j)
+			xb.WriteString(x)
+		}
+		sendSubsonic(w, r, map[string]interface{}{"playlist": map[string]interface{}{"id": id, "name": "Submuz", "songCount": len(songs), "duration": len(songs)*210, "entry": ja}}, fmt.Sprintf(`<playlist id="%s" name="Submuz" songCount="%d">%s</playlist>`, id, len(songs), xb.String()))
+	case "createplaylist", "updateplaylist", "deleteplaylist":
+		sendSubsonic(w, r, map[string]interface{}{"playlist": map[string]interface{}{"id": "1", "name": "Submuz"}}, `<playlist id="1" name="Submuz"/>`)
+	case "getcoverart":
+		id := r.URL.Query().Get("id")
+		if id == "" { id = "dQw4w9WgXcQ" }
+		cleanID := id
+		if strings.Contains(id, "-") {
+			parts := strings.Split(id, "-")
+			cleanID = parts[len(parts)-1]
+		}
+		thumb := fmt.Sprintf("https://img.youtube.com/vi/%s/mqdefault.jpg", cleanID)
+		http.Redirect(w, r, thumb, 302)
+	case "getavatar":
+		w.Header().Set("Content-Type", "image/jpeg")
+		// Return 1x1 transparent or redirect to default avatar
+		http.Redirect(w, r, "https://img.youtube.com/vi/dQw4w9WgXcQ/mqdefault.jpg", 302)
+	case "getlyrics", "getlyricsbysongid":
+		// Amcfy expects lyrics
+		sendSubsonic(w, r, map[string]interface{}{"lyrics": map[string]interface{}{"artist": "YouTube", "title": "Lyrics", "value": ""}}, `<lyrics artist="YouTube" title="Lyrics"></lyrics>`)
+	case "scrobble":
+		sendSubsonic(w, r, map[string]interface{}{}, "")
+	case "getscanstatus", "startscan":
+		sendSubsonic(w, r, map[string]interface{}{"scanStatus": map[string]interface{}{"scanning": false, "count": len(songs)}}, fmt.Sprintf(`<scanStatus scanning="false" count="%d"/>`, len(songs)))
 	case "stream", "download":
 		id := r.URL.Query().Get("id")
 		cleanID := id
@@ -385,9 +502,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		mu.RLock()
 		song, ok := db[cleanID]
-		if !ok {
-			song, ok = db[id]
-		}
+		if !ok { song, ok = db[id] }
 		mu.RUnlock()
 		if !ok {
 			for _, s := range songs {
@@ -404,53 +519,28 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		token := os.Getenv("BOT_TOKEN")
 		fp := song.FilePath
-		if fp == "" {
-			fp = getTelegramFilePath(song.FileID)
-		}
+		if fp == "" { fp = getTelegramFilePath(song.FileID) }
 		if token != "" && fp != "" {
 			direct := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, fp)
 			http.Redirect(w, r, direct, 302)
 			return
 		}
 		http.Error(w, "file not found", 404)
-	case "getcoverart":
-		id := r.URL.Query().Get("id")
-		if id == "" {
-			id = "dQw4w9WgXcQ"
-		}
-		cleanID := id
-		if strings.Contains(id, "-") {
-			parts := strings.Split(id, "-")
-			cleanID = parts[len(parts)-1]
-		}
-		thumb := fmt.Sprintf("https://img.youtube.com/vi/%s/mqdefault.jpg", cleanID)
-		http.Redirect(w, r, thumb, 302)
-	case "getopensubsonicextensions":
-		sendSubsonic(w, r, map[string]interface{}{"openSubsonicExtensions": map[string]interface{}{"extension": []map[string]interface{}{{"name": "transcode", "version": 1}}}}, `<openSubsonicExtensions><extension name="transcode" version="1"/></openSubsonicExtensions>`)
 	default:
 		sendSubsonic(w, r, map[string]interface{}{}, "")
 	}
 }
 
+
 func health(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(200)
-		return
-	}
 	mu.RLock()
 	c := len(db)
 	mu.RUnlock()
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte(fmt.Sprintf("OK v12.1-single-login - %d songs - /rest/ping - /admin/login", c)))
+	w.Write([]byte(fmt.Sprintf("OK v10-m4a-subsonic - %d songs - Subsonic: /rest/ping", c)))
 }
 
 func listHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(200)
-		return
-	}
 	mu.RLock()
 	defer mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -458,20 +548,10 @@ func listHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func dbHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(200)
-		return
-	}
 	http.ServeFile(w, r, dbPath)
 }
 
 func playHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(200)
-		return
-	}
 	ytUrl := r.URL.Query().Get("url")
 	if ytUrl == "" {
 		http.Error(w, "use /play?url=YT_URL", 400)
@@ -569,84 +649,6 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, tmpFile)
 }
 
-func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(200)
-		return
-	}
-	if r.Method != "POST" {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": "POST only"})
-		return
-	}
-	var req struct {
-		User     string `json:"user"`
-		Pass     string `json:"pass"`
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", 400)
-		return
-	}
-	u := req.User
-	if u == "" {
-		u = req.Username
-	}
-	pw := req.Pass
-	if pw == "" {
-		pw = req.Password
-	}
-	expUser := os.Getenv("ADMIN_USER")
-	if expUser == "" {
-		expUser = "admin"
-	}
-	expPass := os.Getenv("ADMIN_PASS")
-	if expPass == "" {
-		expPass = "admin123"
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if u == expUser && pw == expPass {
-		token := base64.StdEncoding.EncodeToString([]byte(u + ":" + pw))
-		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "token": token, "user": u})
-	} else {
-		w.WriteHeader(401)
-		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": "wrong credentials"})
-	}
-}
-
-func adminCheckHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(200)
-		return
-	}
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		auth = r.URL.Query().Get("token")
-	}
-	if strings.HasPrefix(auth, "Bearer ") {
-		auth = strings.TrimPrefix(auth, "Bearer ")
-	}
-	expUser := os.Getenv("ADMIN_USER")
-	if expUser == "" {
-		expUser = "admin"
-	}
-	expPass := os.Getenv("ADMIN_PASS")
-	if expPass == "" {
-		expPass = "admin123"
-	}
-	expectedToken := base64.StdEncoding.EncodeToString([]byte(expUser + ":" + expPass))
-	w.Header().Set("Content-Type", "application/json")
-	if auth == expectedToken {
-		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
-	} else {
-		w.WriteHeader(401)
-		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false})
-	}
-}
-
 func main() {
 	loadDB()
 	port := os.Getenv("PORT")
@@ -659,9 +661,7 @@ func main() {
 	http.HandleFunc("/db", dbHandler)
 	http.HandleFunc("/play", playHandler)
 	http.HandleFunc("/convert", playHandler)
-	http.HandleFunc("/admin/login", adminLoginHandler)
-	http.HandleFunc("/admin/check", adminCheckHandler)
 	http.HandleFunc("/rest/", subsonicHandler)
-	log.Println("Listening on 0.0.0.0:" + port + " v12.1-single-login")
+	log.Println("Listening on 0.0.0.0:" + port + " with Subsonic API v10")
 	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, nil))
 }
