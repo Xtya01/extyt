@@ -206,7 +206,7 @@ func isSubsonicAuthOK(r *http.Request) bool {
 
 func subsonicBase() map[string]interface{} {
 	return map[string]interface{}{
-		"status": "ok", "version": "1.16.1", "type": "extyt", "serverVersion": "v11-m4a-subsonic-admin", "openSubsonic": true,
+		"status": "ok", "version": "1.16.1", "type": "extyt", "serverVersion": "v10-m4a-subsonic", "openSubsonic": true,
 	}
 }
 
@@ -233,7 +233,7 @@ func sendSubsonic(w http.ResponseWriter, r *http.Request, jsonExtra map[string]i
 		return
 	}
 	w.Header().Set("Content-Type", "text/xml")
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="extyt" serverVersion="v11-m4a-subsonic" openSubsonic="true">%s</subsonic-response>`, xmlInner)
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="extyt" serverVersion="v10-m4a-subsonic" openSubsonic="true">%s</subsonic-response>`, xmlInner)
 }
 
 func xmlEscape(s string) string {
@@ -423,25 +423,15 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func enableCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "*")
-}
-
 func health(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" { w.WriteHeader(200); return }
 	mu.RLock()
 	c := len(db)
 	mu.RUnlock()
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte(fmt.Sprintf("OK v11-m4a-subsonic-admin - %d songs - Subsonic: /rest/ping", c)))
+	w.Write([]byte(fmt.Sprintf("OK v10-m4a-subsonic - %d songs - Subsonic: /rest/ping", c)))
 }
 
 func listHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" { w.WriteHeader(200); return }
 	mu.RLock()
 	defer mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -449,14 +439,10 @@ func listHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func dbHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" { w.WriteHeader(200); return }
 	http.ServeFile(w, r, dbPath)
 }
 
 func playHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	if r.Method == "OPTIONS" { w.WriteHeader(200); return }
 	ytUrl := r.URL.Query().Get("url")
 	if ytUrl == "" {
 		http.Error(w, "use /play?url=YT_URL", 400)
@@ -554,6 +540,68 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, tmpFile)
 }
 
+
+func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
+    enableCORS(w)
+    if r.Method == "OPTIONS" { w.WriteHeader(200); return }
+    if r.Method != "POST" {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": "POST only"})
+        return
+    }
+    var req struct {
+        User string `json:"user"`
+        Pass string `json:"pass"`
+        Username string `json:"username"`
+        Password string `json:"password"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "invalid json", 400)
+        return
+    }
+    u := req.User
+    if u == "" { u = req.Username }
+    pw := req.Pass
+    if pw == "" { pw = req.Password }
+
+    expUser := os.Getenv("ADMIN_USER")
+    if expUser == "" { expUser = "admin" }
+    expPass := os.Getenv("ADMIN_PASS")
+    if expPass == "" { expPass = "admin123" }
+
+    w.Header().Set("Content-Type", "application/json")
+    if u == expUser && pw == expPass {
+        // simple token = base64 user:pass
+        token := base64.StdEncoding.EncodeToString([]byte(u + ":" + pw))
+        json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "token": token, "user": u})
+    } else {
+        w.WriteHeader(401)
+        json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": "wrong credentials"})
+    }
+}
+
+func adminCheckHandler(w http.ResponseWriter, r *http.Request) {
+    enableCORS(w)
+    if r.Method == "OPTIONS" { w.WriteHeader(200); return }
+    auth := r.Header.Get("Authorization")
+    if auth == "" { auth = r.URL.Query().Get("token") }
+    if strings.HasPrefix(auth, "Bearer ") { auth = strings.TrimPrefix(auth, "Bearer ") }
+    
+    expUser := os.Getenv("ADMIN_USER")
+    if expUser == "" { expUser = "admin" }
+    expPass := os.Getenv("ADMIN_PASS")
+    if expPass == "" { expPass = "admin123" }
+    expectedToken := base64.StdEncoding.EncodeToString([]byte(expUser + ":" + expPass))
+    
+    w.Header().Set("Content-Type", "application/json")
+    if auth == expectedToken || auth == expUser+":"+expPass {
+        json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+    } else {
+        w.WriteHeader(401)
+        json.NewEncoder(w).Encode(map[string]interface{}{"ok": false})
+    }
+}
+
 func main() {
 	loadDB()
 	port := os.Getenv("PORT")
@@ -565,6 +613,8 @@ func main() {
 	http.HandleFunc("/list", listHandler)
 	http.HandleFunc("/db", dbHandler)
 	http.HandleFunc("/play", playHandler)
+	http.HandleFunc("/admin/login", adminLoginHandler)
+	http.HandleFunc("/admin/check", adminCheckHandler)
 	http.HandleFunc("/convert", playHandler)
 	http.HandleFunc("/rest/", subsonicHandler)
 	log.Println("Listening on 0.0.0.0:" + port + " with Subsonic API v10")
