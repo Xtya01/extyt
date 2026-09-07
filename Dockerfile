@@ -1,1 +1,10 @@
-FROM golang:1.21-bookworm RUN apt-get update && apt-get install -y ffmpeg curl nodejs npm python3-pip unzip && rm -rf /var/lib/apt/lists/* RUN pip3 install --break-system-packages -U yt-dlp RUN curl -fsSL https://deno.land/install.sh | sh ENV DENO_INSTALL="/root/.deno" ENV PATH="/root/.deno/bin:/usr/local/bin:/usr/bin:$PATH" RUN ln -sf /usr/bin/nodejs /usr/bin/node || true && ln -sf /usr/bin/node /usr/local/bin/node || true RUN node --version && deno --version && yt-dlp --version WORKDIR /app COPY main.go ./ RUN GO111MODULE=off go build -o server main.go ENV PORT=8000 EXPOSE 8000 CMD ["./server"]
+FROM golang:1.21-bookworm
+RUN apt-get update && apt-get install -y ffmpeg curl && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --break-system-packages -U yt-dlp 2>/dev/null || pip3 install -U yt-dlp
+WORKDIR /app
+COPY go.mod./
+COPY main.go./
+RUN go mod tidy && go build -o server main.go
+ENV PORT=8000
+EXPOSE 8000
+CMD ["./server"]
