@@ -80,16 +80,15 @@ var (
 	backupLock   sync.Mutex
 	latestFileID string
 	searchCache  sync.Map
-	sem          = make(chan struct{}, 1)
+	sem          = make(chan struct{}, 1) // Limit concurrent conversion on 512MB RAM
 )
 
 const dbPath = "/tmp/db.json"
 const cookiePath = "/tmp/cookies.txt"
 
-// -------------------- Database Parser & Telegram Persistence --------------------
+// -------------------- Database & Telegram Persistence --------------------
 
 func parseDBData(data []byte) (AppDB, bool) {
-	// Try new AppDB schema
 	var newDB AppDB
 	if err := json.Unmarshal(data, &newDB); err == nil && len(newDB.Songs) > 0 {
 		if newDB.Playlists == nil {
@@ -101,7 +100,6 @@ func parseDBData(data []byte) (AppDB, bool) {
 		return newDB, true
 	}
 
-	// Try legacy map[string]Song schema
 	var oldMap map[string]Song
 	if err := json.Unmarshal(data, &oldMap); err == nil && len(oldMap) > 0 {
 		return AppDB{
@@ -111,7 +109,6 @@ func parseDBData(data []byte) (AppDB, bool) {
 		}, true
 	}
 
-	// Valid AppDB even if empty
 	if newDB.Songs != nil {
 		if newDB.Playlists == nil {
 			newDB.Playlists = make(map[string]Playlist)
@@ -131,7 +128,7 @@ func loadDB() {
 
 	loaded := false
 
-	// 1. Try local cache only if it contains songs
+	// Check local cache if songs exist
 	if data, err := os.ReadFile(dbPath); err == nil {
 		if parsed, ok := parseDBData(data); ok && len(parsed.Songs) > 0 {
 			appDB = parsed
@@ -140,11 +137,11 @@ func loadDB() {
 		}
 	}
 
-	// 2. If local cache was empty/missing, load from Telegram DB_JSON_FILE_ID
+	// Restore from Telegram if local cache was empty
 	if !loaded || len(appDB.Songs) == 0 {
 		fileID := strings.TrimSpace(os.Getenv("DB_JSON_FILE_ID"))
 		if fileID != "" {
-			log.Printf("[DB] Downloading database from Telegram FileID: %s...", fileID)
+			log.Printf("[DB] Fetching database from Telegram FileID: %s...", fileID)
 			data, err := downloadDBFromTelegram(fileID)
 			if err == nil {
 				if parsed, ok := parseDBData(data); ok && len(parsed.Songs) > 0 {
@@ -153,14 +150,10 @@ func loadDB() {
 					os.WriteFile(dbPath, data, 0644)
 					log.Printf("[DB] Successfully restored from Telegram: %d songs, %d playlists, %d users", len(appDB.Songs), len(appDB.Playlists), len(appDB.Users))
 					return
-				} else {
-					log.Printf("[DB] Downloaded Telegram DB but parsing failed or 0 songs found")
 				}
 			} else {
 				log.Printf("[DB] Telegram download error: %v", err)
 			}
-		} else {
-			log.Println("[DB] DB_JSON_FILE_ID not set in environment")
 		}
 	}
 
@@ -248,14 +241,14 @@ func downloadDBFromTelegram(fileID string) ([]byte, error) {
 	fileID = strings.TrimSpace(fileID)
 	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
 	if token == "" || fileID == "" {
-		return nil, fmt.Errorf("BOT_TOKEN or fileID missing")
+		return nil, fmt.Errorf("missing credentials")
 	}
 
 	client := &http.Client{Timeout: 25 * time.Second}
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", token, fileID)
 	resp, err := client.Get(apiURL)
 	if err != nil {
-		return nil, fmt.Errorf("getFile request failed: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -268,21 +261,17 @@ func downloadDBFromTelegram(fileID string) ([]byte, error) {
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(respBytes, &gf); err != nil || !gf.Ok {
-		return nil, fmt.Errorf("getFile error from TG: %s", gf.Description)
+		return nil, fmt.Errorf("getFile error: %s", gf.Description)
 	}
 
 	fileURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, gf.Result.FilePath)
 	r2, err := client.Get(fileURL)
 	if err != nil {
-		return nil, fmt.Errorf("file download failed: %w", err)
+		return nil, err
 	}
 	defer r2.Body.Close()
 
-	data, err := io.ReadAll(r2.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading file body failed: %w", err)
-	}
-	return data, nil
+	return io.ReadAll(r2.Body)
 }
 
 func getTelegramFilePath(fileID string) string {
@@ -316,7 +305,7 @@ func proxyTelegramAudio(w http.ResponseWriter, r *http.Request, token, fp string
 	audioURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, fp)
 	req, err := http.NewRequestWithContext(r.Context(), "GET", audioURL, nil)
 	if err != nil {
-		http.Error(w, "Error creating proxy request", 500)
+		http.Error(w, "Proxy request failure", 500)
 		return
 	}
 
@@ -327,7 +316,7 @@ func proxyTelegramAudio(w http.ResponseWriter, r *http.Request, token, fp string
 	client := &http.Client{Timeout: 2 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
-		http.Error(w, "Upstream storage unreachable", 502)
+		http.Error(w, "Storage unavailable", 502)
 		return
 	}
 	defer resp.Body.Close()
@@ -341,7 +330,7 @@ func proxyTelegramAudio(w http.ResponseWriter, r *http.Request, token, fp string
 	io.Copy(w, resp.Body)
 }
 
-// -------------------- Helpers & Temp Cleaner --------------------
+// -------------------- Helpers & Cleaner --------------------
 
 func getCookiesArg() []string {
 	if b64 := strings.TrimSpace(os.Getenv("YT_COOKIES_B64")); b64 != "" {
@@ -452,7 +441,7 @@ func isAdmin(r *http.Request) bool {
 	return getCurrentUser(r) == adminUser
 }
 
-// -------------------- Subsonic Response Encoders --------------------
+// -------------------- Subsonic Response Writers --------------------
 
 func writeSubsonicError(w http.ResponseWriter, code int, msg string, f string) {
 	if f == "json" {
@@ -579,7 +568,7 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 
 func searchYouTube(query string, maxResults int) []Song {
 	if maxResults <= 0 {
-		maxResults = 4
+		maxResults = 5
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer cancel()
@@ -789,7 +778,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			})
 		} else {
 			var b strings.Builder
-			b.WriteString(fmt.Sprintf(`<album id="al-1" name="Cached Songs" artist="YouTube" artistId="ar-1" songCount="%d">`, len(appDB.Songs)))
+			b.WriteString(fmt.Sprintf(`<album id="al-1" name="Cached Songs" artist="Music" artistId="ar-1" songCount="%d">`, len(appDB.Songs)))
 			for _, s := range appDB.Songs {
 				b.WriteString(fmt.Sprintf(`<song id="%s" title="%s" artist="%s" coverArt="%s" duration="%d" playCount="%d"/>`, s.YTID, xmlEscape(s.Title), xmlEscape(s.Artist), s.YTID, s.Duration, s.PlayCount))
 			}
@@ -888,71 +877,93 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
 
+	// Search Handler with Pagination & Fast Multi-source Results
 	case "search2", "search3":
 		q := strings.TrimSpace(r.URL.Query().Get("query"))
 		qLower := strings.ToLower(q)
 
+		songCount := 25
+		if sc := r.URL.Query().Get("songCount"); sc != "" {
+			if v, err := strconv.Atoi(sc); err == nil && v > 0 {
+				songCount = v
+			}
+		}
+		if songCount > 50 {
+			songCount = 50
+		}
+
+		songOffset := 0
+		if so := r.URL.Query().Get("songOffset"); so != "" {
+			if v, err := strconv.Atoi(so); err == nil && v >= 0 {
+				songOffset = v
+			}
+		}
+
+		var allMatched []Song
 		if val, cached := searchCache.Load(qLower); cached {
-			songs := val.([]map[string]interface{})
-			if f == "json" {
-				searchObj := map[string]interface{}{"artist": []interface{}{}, "album": []interface{}{}, "song": songs}
-				writeSubsonicOK(w, f, map[string]interface{}{"searchResult2": searchObj, "searchResult3": searchObj})
-				return
-			}
-		}
-
-		mu.RLock()
-		var matched []Song
-		for _, s := range appDB.Songs {
-			if qLower == "" || strings.Contains(strings.ToLower(s.Title), qLower) || strings.Contains(strings.ToLower(s.Artist), qLower) {
-				matched = append(matched, s)
-			}
-		}
-		mu.RUnlock()
-
-		if len(matched) < 15 && len(q) >= 2 {
-			seen := map[string]bool{}
-			for _, s := range matched {
-				seen[s.YTID] = true
-			}
-
-			var wg sync.WaitGroup
-			var jioResults []Song
-			var ytResults []Song
-
-			wg.Add(2)
-			go func() {
-				defer wg.Done()
-				jioResults = searchJioSaavn(q, 10)
-			}()
-			go func() {
-				defer wg.Done()
-				ytResults = searchYouTube(q, 4)
-			}()
-			wg.Wait()
-
-			for _, js := range jioResults {
-				if !seen[js.YTID] {
-					matched = append(matched, js)
-					seen[js.YTID] = true
-					ensureSongInMemory(js)
+			allMatched = val.([]Song)
+		} else {
+			mu.RLock()
+			for _, s := range appDB.Songs {
+				if qLower == "" || strings.Contains(strings.ToLower(s.Title), qLower) || strings.Contains(strings.ToLower(s.Artist), qLower) {
+					allMatched = append(allMatched, s)
 				}
 			}
-			for _, ys := range ytResults {
-				if !seen[ys.YTID] {
-					matched = append(matched, ys)
-					seen[ys.YTID] = true
-					ensureSongInMemory(ys)
+			mu.RUnlock()
+
+			if len(allMatched) < 30 && len(q) >= 2 {
+				seen := map[string]bool{}
+				for _, s := range allMatched {
+					seen[s.YTID] = true
+				}
+
+				var wg sync.WaitGroup
+				var jioResults []Song
+				var ytResults []Song
+
+				wg.Add(2)
+				go func() {
+					defer wg.Done()
+					jioResults = searchJioSaavn(q, 25)
+				}()
+				go func() {
+					defer wg.Done()
+					ytResults = searchYouTube(q, 6)
+				}()
+				wg.Wait()
+
+				for _, js := range jioResults {
+					if !seen[js.YTID] {
+						allMatched = append(allMatched, js)
+						seen[js.YTID] = true
+						ensureSongInMemory(js)
+					}
+				}
+				for _, ys := range ytResults {
+					if !seen[ys.YTID] {
+						allMatched = append(allMatched, ys)
+						seen[ys.YTID] = true
+						ensureSongInMemory(ys)
+					}
 				}
 			}
+			searchCache.Store(qLower, allMatched)
+		}
+
+		totalSongs := len(allMatched)
+		var pagedSongs []Song
+		if songOffset < totalSongs {
+			end := songOffset + songCount
+			if end > totalSongs {
+				end = totalSongs
+			}
+			pagedSongs = allMatched[songOffset:end]
 		}
 
 		songs := []map[string]interface{}{}
-		for _, s := range matched {
+		for _, s := range pagedSongs {
 			songs = append(songs, songToMap(s))
 		}
-
-		searchCache.Store(qLower, songs)
 
 		if f == "json" {
 			searchObj := map[string]interface{}{
@@ -971,7 +982,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			var b strings.Builder
 			b.WriteString(fmt.Sprintf(`<%s>`, rootTag))
-			for _, s := range matched {
+			for _, s := range pagedSongs {
 				b.WriteString(fmt.Sprintf(`<song id="%s" title="%s" artist="%s" album="Online Search" duration="%d" coverArt="%s"/>`,
 					s.YTID, xmlEscape(s.Title), xmlEscape(s.Artist), s.Duration, s.YTID))
 			}
@@ -1317,6 +1328,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		saveDB()
 		writeSubsonicOK(w, f, map[string]interface{}{})
 
+	// Unified Multi-Source Lyrics (JioSaavn + LRCLib)
 	case "getlyrics", "getlyricsbysongid":
 		id := r.URL.Query().Get("id")
 		artist := r.URL.Query().Get("artist")
@@ -1487,7 +1499,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 		"-o", tmpFile,
 	}
-	ytArgs = append(ytArgs, cookieArgs...)
+	ytArgs = append(cookieArgs, ytArgs...)
 	ytArgs = append(ytArgs, ytUrl)
 
 	cmd := exec.Command("yt-dlp", ytArgs...)
@@ -1574,7 +1586,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		"--playlist-end", fmt.Sprintf("%d", maxVideos),
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 	}
-	args = append(args, cookieArgs...)
+	args = append(cookieArgs, args...)
 	args = append(args, playlistURL)
 
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
@@ -1891,7 +1903,7 @@ func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// -------------------- Lyrics Provider --------------------
+// -------------------- Lyrics Provider (JioSaavn + LRCLib) --------------------
 
 func fetchJioLyrics(jioID string) string {
 	cleanID := strings.TrimPrefix(jioID, "js-")
@@ -2035,10 +2047,10 @@ func parseJioImage(raw json.RawMessage) string {
 
 func searchJioSaavn(query string, limit int) []Song {
 	if limit <= 0 {
-		limit = 8
+		limit = 25
 	}
-	apiURL := fmt.Sprintf("%s/search?query=%s", jioAPI, url.QueryEscape(query))
-	client := &http.Client{Timeout: 3 * time.Second}
+	apiURL := fmt.Sprintf("%s/search?query=%s&limit=%d", jioAPI, url.QueryEscape(query), limit)
+	client := &http.Client{Timeout: 3500 * time.Millisecond}
 	resp, err := client.Get(apiURL)
 	if err != nil {
 		return nil
@@ -2178,7 +2190,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v19-restored | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
+	fmt.Fprintf(w, "OK v20-production | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
