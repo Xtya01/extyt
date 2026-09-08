@@ -86,53 +86,92 @@ var (
 const dbPath = "/tmp/db.json"
 const cookiePath = "/tmp/cookies.txt"
 
-// -------------------- Database & Telegram Persistence --------------------
+// -------------------- Database Parser & Telegram Persistence --------------------
+
+func parseDBData(data []byte) (AppDB, bool) {
+	// Try new AppDB schema
+	var newDB AppDB
+	if err := json.Unmarshal(data, &newDB); err == nil && len(newDB.Songs) > 0 {
+		if newDB.Playlists == nil {
+			newDB.Playlists = make(map[string]Playlist)
+		}
+		if newDB.Users == nil {
+			newDB.Users = make(map[string]User)
+		}
+		return newDB, true
+	}
+
+	// Try legacy map[string]Song schema
+	var oldMap map[string]Song
+	if err := json.Unmarshal(data, &oldMap); err == nil && len(oldMap) > 0 {
+		return AppDB{
+			Songs:     oldMap,
+			Playlists: make(map[string]Playlist),
+			Users:     make(map[string]User),
+		}, true
+	}
+
+	// Valid AppDB even if empty
+	if newDB.Songs != nil {
+		if newDB.Playlists == nil {
+			newDB.Playlists = make(map[string]Playlist)
+		}
+		if newDB.Users == nil {
+			newDB.Users = make(map[string]User)
+		}
+		return newDB, true
+	}
+
+	return AppDB{}, false
+}
 
 func loadDB() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	data, err := os.ReadFile(dbPath)
-	if err == nil {
-		var newDB AppDB
-		if json.Unmarshal(data, &newDB) == nil && newDB.Songs != nil {
-			appDB = newDB
-			if appDB.Playlists == nil {
-				appDB.Playlists = make(map[string]Playlist)
-			}
-			if appDB.Users == nil {
-				appDB.Users = make(map[string]User)
-			}
+	loaded := false
+
+	// 1. Try local cache only if it contains songs
+	if data, err := os.ReadFile(dbPath); err == nil {
+		if parsed, ok := parseDBData(data); ok && len(parsed.Songs) > 0 {
+			appDB = parsed
+			loaded = true
 			log.Printf("[DB] Loaded local cache: %d songs, %d playlists, %d users", len(appDB.Songs), len(appDB.Playlists), len(appDB.Users))
-			return
 		}
 	}
 
-	if fileID := os.Getenv("DB_JSON_FILE_ID"); fileID != "" {
-		if err := downloadDBFromTelegram(fileID); err == nil {
-			if data, err := os.ReadFile(dbPath); err == nil {
-				var newDB AppDB
-				if json.Unmarshal(data, &newDB) == nil && newDB.Songs != nil {
-					appDB = newDB
-					if appDB.Playlists == nil {
-						appDB.Playlists = make(map[string]Playlist)
-					}
-					if appDB.Users == nil {
-						appDB.Users = make(map[string]User)
-					}
-					log.Printf("[DB] Restored from Telegram: %d songs, %d playlists", len(appDB.Songs), len(appDB.Playlists))
+	// 2. If local cache was empty/missing, load from Telegram DB_JSON_FILE_ID
+	if !loaded || len(appDB.Songs) == 0 {
+		fileID := strings.TrimSpace(os.Getenv("DB_JSON_FILE_ID"))
+		if fileID != "" {
+			log.Printf("[DB] Downloading database from Telegram FileID: %s...", fileID)
+			data, err := downloadDBFromTelegram(fileID)
+			if err == nil {
+				if parsed, ok := parseDBData(data); ok && len(parsed.Songs) > 0 {
+					appDB = parsed
+					latestFileID = fileID
+					os.WriteFile(dbPath, data, 0644)
+					log.Printf("[DB] Successfully restored from Telegram: %d songs, %d playlists, %d users", len(appDB.Songs), len(appDB.Playlists), len(appDB.Users))
 					return
+				} else {
+					log.Printf("[DB] Downloaded Telegram DB but parsing failed or 0 songs found")
 				}
+			} else {
+				log.Printf("[DB] Telegram download error: %v", err)
 			}
+		} else {
+			log.Println("[DB] DB_JSON_FILE_ID not set in environment")
 		}
 	}
 
-	appDB = AppDB{
-		Songs:     make(map[string]Song),
-		Playlists: make(map[string]Playlist),
-		Users:     make(map[string]User),
+	if len(appDB.Songs) == 0 {
+		appDB = AppDB{
+			Songs:     make(map[string]Song),
+			Playlists: make(map[string]Playlist),
+			Users:     make(map[string]User),
+		}
+		log.Println("[DB] Initialized fresh empty DB")
 	}
-	log.Println("[DB] Initialized empty DB")
 }
 
 func saveDB() {
@@ -148,12 +187,12 @@ func saveDB() {
 
 func backupDBToTelegram() {
 	if !backupLock.TryLock() {
-		return // Avoid stacking backup requests
+		return
 	}
 	defer backupLock.Unlock()
 
-	token := os.Getenv("BOT_TOKEN")
-	chatID := os.Getenv("CHANNEL_ID")
+	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+	chatID := strings.TrimSpace(os.Getenv("CHANNEL_ID"))
 	if token == "" || chatID == "" {
 		return
 	}
@@ -205,45 +244,51 @@ func backupDBToTelegram() {
 	}
 }
 
-func downloadDBFromTelegram(fileID string) error {
-	token := os.Getenv("BOT_TOKEN")
-	if token == "" {
-		return fmt.Errorf("missing BOT_TOKEN")
+func downloadDBFromTelegram(fileID string) ([]byte, error) {
+	fileID = strings.TrimSpace(fileID)
+	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+	if token == "" || fileID == "" {
+		return nil, fmt.Errorf("BOT_TOKEN or fileID missing")
 	}
 
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", token, fileID))
+	client := &http.Client{Timeout: 25 * time.Second}
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", token, fileID)
+	resp, err := client.Get(apiURL)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("getFile request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	respBytes, _ := io.ReadAll(resp.Body)
 	var gf struct {
-		Ok     bool `json:"ok"`
-		Result struct {
+		Ok          bool   `json:"ok"`
+		Description string `json:"description"`
+		Result      struct {
 			FilePath string `json:"file_path"`
 		} `json:"result"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&gf); err != nil || !gf.Ok {
-		return fmt.Errorf("failed to get file path")
+	if err := json.Unmarshal(respBytes, &gf); err != nil || !gf.Ok {
+		return nil, fmt.Errorf("getFile error from TG: %s", gf.Description)
 	}
 
-	r2, err := client.Get(fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, gf.Result.FilePath))
+	fileURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, gf.Result.FilePath)
+	r2, err := client.Get(fileURL)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("file download failed: %w", err)
 	}
 	defer r2.Body.Close()
 
 	data, err := io.ReadAll(r2.Body)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("reading file body failed: %w", err)
 	}
-	return os.WriteFile(dbPath, data, 0644)
+	return data, nil
 }
 
 func getTelegramFilePath(fileID string) string {
-	token := os.Getenv("BOT_TOKEN")
-	if token == "" {
+	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+	fileID = strings.TrimSpace(fileID)
+	if token == "" || fileID == "" {
 		return ""
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -299,8 +344,7 @@ func proxyTelegramAudio(w http.ResponseWriter, r *http.Request, token, fp string
 // -------------------- Helpers & Temp Cleaner --------------------
 
 func getCookiesArg() []string {
-	if b64 := os.Getenv("YT_COOKIES_B64"); b64 != "" {
-		b64 = strings.TrimSpace(b64)
+	if b64 := strings.TrimSpace(os.Getenv("YT_COOKIES_B64")); b64 != "" {
 		b64 = strings.ReplaceAll(b64, "\n", "")
 		b64 = strings.ReplaceAll(b64, "\r", "")
 		b64 = strings.ReplaceAll(b64, " ", "")
@@ -345,7 +389,7 @@ func startTempCleaner() {
 // -------------------- Authentication --------------------
 
 func getAdminCreds() (string, string) {
-	u := os.Getenv("ADMIN_USER")
+	u := strings.TrimSpace(os.Getenv("ADMIN_USER"))
 	p := os.Getenv("ADMIN_PASS")
 	if u == "" {
 		u = "admin"
@@ -775,7 +819,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// FIXED: No deadlock here anymore
 		go func(sid, uname string) {
 			mu.Lock()
 			now := time.Now().Format(time.RFC3339)
@@ -795,7 +838,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 				u.LastPlayed[sid] = now
 				appDB.Users[uname] = u
 			}
-			mu.Unlock() // Unlocked BEFORE calling saveDB!
+			mu.Unlock()
 			saveDB()
 		}(id, currentUser)
 
@@ -1407,7 +1450,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RUnlock()
 
 	if exists && song.FileID != "" {
-		token := os.Getenv("BOT_TOKEN")
+		token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
 		fp := song.FilePath
 		if fp == "" {
 			fp = getTelegramFilePath(song.FileID)
@@ -1456,8 +1499,8 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().Format(time.RFC3339)
-	token := os.Getenv("BOT_TOKEN")
-	chatID := os.Getenv("CHANNEL_ID")
+	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+	chatID := strings.TrimSpace(os.Getenv("CHANNEL_ID"))
 	fileID := ""
 	fp := ""
 
@@ -2107,7 +2150,6 @@ func getJioStreamURL(jioID string) string {
 	return mi.Vlink
 }
 
-// In-Memory cache without triggering Telegram uploads on search
 func ensureSongInMemory(s Song) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -2129,14 +2171,14 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	fid := latestFileID
 	if fid == "" {
-		fid = os.Getenv("DB_JSON_FILE_ID")
+		fid = strings.TrimSpace(os.Getenv("DB_JSON_FILE_ID"))
 	}
 	if fid == "" {
-		fid = "Not yet generated (import playlist to sync)"
+		fid = "Not configured"
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v18-unlocked | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
+	fmt.Fprintf(w, "OK v19-restored | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
