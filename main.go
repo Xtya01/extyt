@@ -256,23 +256,30 @@ func getAdminCreds() (string, string) {
 
 // getCurrentUser returns username if authenticated, else ""
 func getCurrentUser(r *http.Request) string {
-	u := r.URL.Query().Get("u")
+	u := strings.TrimSpace(r.URL.Query().Get("u"))
 	p := r.URL.Query().Get("p")
+	// Subsonic sometimes sends enc:HEX password
+	if strings.HasPrefix(p, "enc:") {
+		// accept for matching username (client-side obfuscation only)
+		p = p // keep; we match via username + enc prefix below
+	}
 	if u == "" {
 		return ""
 	}
-	// check admin first
 	adminUser, adminPass := getAdminCreds()
+	adminUser = strings.TrimSpace(adminUser)
+	// token auth (Amperfy): t + s
+	hasToken := r.URL.Query().Get("t") != "" && r.URL.Query().Get("s") != ""
+
 	if u == adminUser {
-		if p == adminPass || strings.HasPrefix(p, "enc:") || (r.URL.Query().Get("t") != "" && r.URL.Query().Get("s") != "") {
+		if p == adminPass || strings.HasPrefix(p, "enc:") || hasToken {
 			return u
 		}
 	}
-	// check registered users
 	mu.RLock()
 	defer mu.RUnlock()
 	if user, ok := appDB.Users[u]; ok {
-		if p == user.Password || strings.HasPrefix(p, "enc:") || (r.URL.Query().Get("t") != "" && r.URL.Query().Get("s") != "") {
+		if p == user.Password || strings.HasPrefix(p, "enc:") || hasToken {
 			return u
 		}
 	}
