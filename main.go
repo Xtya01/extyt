@@ -80,13 +80,13 @@ var (
 	backupLock   sync.Mutex
 	latestFileID string
 	searchCache  sync.Map
-	sem          = make(chan struct{}, 1) // Limit concurrent conversion on 512MB RAM
+	sem          = make(chan struct{}, 1) // Prevents RAM exhaustion on Koyeb Free (512MB)
 )
 
 const dbPath = "/tmp/db.json"
 const cookiePath = "/tmp/cookies.txt"
 
-// -------------------- Database & Telegram Persistence --------------------
+// -------------------- Database Parser & Telegram Persistence --------------------
 
 func parseDBData(data []byte) (AppDB, bool) {
 	var newDB AppDB
@@ -128,7 +128,6 @@ func loadDB() {
 
 	loaded := false
 
-	// Check local cache if songs exist
 	if data, err := os.ReadFile(dbPath); err == nil {
 		if parsed, ok := parseDBData(data); ok && len(parsed.Songs) > 0 {
 			appDB = parsed
@@ -137,7 +136,6 @@ func loadDB() {
 		}
 	}
 
-	// Restore from Telegram if local cache was empty
 	if !loaded || len(appDB.Songs) == 0 {
 		fileID := strings.TrimSpace(os.Getenv("DB_JSON_FILE_ID"))
 		if fileID != "" {
@@ -149,6 +147,7 @@ func loadDB() {
 					latestFileID = fileID
 					os.WriteFile(dbPath, data, 0644)
 					log.Printf("[DB] Successfully restored from Telegram: %d songs, %d playlists, %d users", len(appDB.Songs), len(appDB.Playlists), len(appDB.Users))
+					ensureAdminUser()
 					return
 				}
 			} else {
@@ -164,6 +163,21 @@ func loadDB() {
 			Users:     make(map[string]User),
 		}
 		log.Println("[DB] Initialized fresh empty DB")
+	}
+
+	ensureAdminUser()
+}
+
+func ensureAdminUser() {
+	adminU, adminP := getAdminCreds()
+	if _, ok := appDB.Users[adminU]; !ok {
+		appDB.Users[adminU] = User{
+			Username:   adminU,
+			Password:   adminP,
+			Starred:    make(map[string]bool),
+			PlayCount:  make(map[string]int),
+			LastPlayed: make(map[string]string),
+		}
 	}
 }
 
@@ -241,7 +255,7 @@ func downloadDBFromTelegram(fileID string) ([]byte, error) {
 	fileID = strings.TrimSpace(fileID)
 	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
 	if token == "" || fileID == "" {
-		return nil, fmt.Errorf("missing credentials")
+		return nil, fmt.Errorf("credentials missing")
 	}
 
 	client := &http.Client{Timeout: 25 * time.Second}
@@ -305,7 +319,7 @@ func proxyTelegramAudio(w http.ResponseWriter, r *http.Request, token, fp string
 	audioURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, fp)
 	req, err := http.NewRequestWithContext(r.Context(), "GET", audioURL, nil)
 	if err != nil {
-		http.Error(w, "Proxy request failure", 500)
+		http.Error(w, "Proxy request error", 500)
 		return
 	}
 
@@ -316,7 +330,7 @@ func proxyTelegramAudio(w http.ResponseWriter, r *http.Request, token, fp string
 	client := &http.Client{Timeout: 2 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
-		http.Error(w, "Storage unavailable", 502)
+		http.Error(w, "Storage unreachable", 502)
 		return
 	}
 	defer resp.Body.Close()
@@ -333,7 +347,7 @@ func proxyTelegramAudio(w http.ResponseWriter, r *http.Request, token, fp string
 // -------------------- Helpers & Cleaner --------------------
 
 func getCookiesArg() []string {
-	if b64 := strings.TrimSpace(os.Getenv("YT_COOKIES_B64")); b64 != "" {
+	if b64 := strings.TrimSpace(os.Getenv("YT_COOKIES_B64")); len(b64) > 50 {
 		b64 = strings.ReplaceAll(b64, "\n", "")
 		b64 = strings.ReplaceAll(b64, "\r", "")
 		b64 = strings.ReplaceAll(b64, " ", "")
@@ -341,19 +355,14 @@ func getCookiesArg() []string {
 		if err != nil {
 			decoded, err = base64.RawStdEncoding.DecodeString(b64)
 		}
-		if err == nil {
+		if err == nil && len(decoded) > 50 {
 			os.WriteFile(cookiePath, decoded, 0644)
 			return []string{"--cookies", cookiePath}
 		}
 	}
-	if raw := os.Getenv("YT_COOKIES"); raw != "" {
+	if raw := os.Getenv("YT_COOKIES"); len(raw) > 50 {
 		os.WriteFile(cookiePath, []byte(raw), 0644)
 		return []string{"--cookies", cookiePath}
-	}
-	for _, p := range []string{"/app/cookies.txt", "./cookies.txt", "cookies.txt", cookiePath} {
-		if info, err := os.Stat(p); err == nil && info.Size() > 100 {
-			return []string{"--cookies", p}
-		}
 	}
 	return []string{}
 }
@@ -441,7 +450,7 @@ func isAdmin(r *http.Request) bool {
 	return getCurrentUser(r) == adminUser
 }
 
-// -------------------- Subsonic Response Writers --------------------
+// -------------------- Subsonic Response Encoders --------------------
 
 func writeSubsonicError(w http.ResponseWriter, code int, msg string, f string) {
 	if f == "json" {
@@ -482,11 +491,28 @@ func writeSubsonicOK(w http.ResponseWriter, f string, body interface{}) {
 	fmt.Fprint(w, `</subsonic-response>`)
 }
 
-func songToMap(s Song) map[string]interface{} {
+func songToMap(s Song, u *User) map[string]interface{} {
 	albumName := "YouTube"
 	if strings.HasPrefix(s.YTID, "js-") {
 		albumName = "JioSaavn"
 	}
+
+	isStarred := false
+	playCount := s.PlayCount
+	lastPlayed := s.LastPlayed
+
+	if u != nil {
+		if u.Starred != nil && u.Starred[s.YTID] {
+			isStarred = true
+		}
+		if pc, ok := u.PlayCount[s.YTID]; ok && pc > 0 {
+			playCount = pc
+		}
+		if lp, ok := u.LastPlayed[s.YTID]; ok && lp != "" {
+			lastPlayed = lp
+		}
+	}
+
 	m := map[string]interface{}{
 		"id":          s.YTID,
 		"title":       s.Title,
@@ -500,18 +526,20 @@ func songToMap(s Song) map[string]interface{} {
 		"suffix":      "m4a",
 		"contentType": "audio/mp4",
 		"isDir":       false,
-		"playCount":   s.PlayCount,
+		"playCount":   playCount,
 		"created":     s.AddedAt,
 		"userRating":  s.Rating,
 	}
-	if s.Starred {
-		m["starred"] = s.LastPlayed
-		if s.LastPlayed == "" {
+
+	if isStarred {
+		if lastPlayed != "" {
+			m["starred"] = lastPlayed
+		} else {
 			m["starred"] = s.AddedAt
 		}
 	}
-	if s.LastPlayed != "" {
-		m["played"] = s.LastPlayed
+	if lastPlayed != "" {
+		m["played"] = lastPlayed
 	}
 	if s.Duration == 0 {
 		m["duration"] = 180
@@ -525,10 +553,10 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-// -------------------- YouTube Fast Scrapers --------------------
+// -------------------- YouTube Engine (Bypasses Datacenter Bot Check) --------------------
 
 func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	args := []string{
@@ -536,9 +564,11 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 		"--no-download",
 		"--no-playlist",
 		"--no-check-certificate",
-		"--extractor-args", "youtube:player_client=web,mweb,android",
+		"--extractor-args", "youtube:player_client=android,ios",
 	}
-	args = append(args, cookieArgs...)
+	if len(cookieArgs) > 0 {
+		args = append(cookieArgs, args...)
+	}
 	args = append(args, ytUrl)
 
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
@@ -570,7 +600,8 @@ func searchYouTube(query string, maxResults int) []Song {
 	if maxResults <= 0 {
 		maxResults = 5
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	// Fixed: 7-second timeout gives python on Koyeb enough time to scrape
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 
 	cookieArgs := getCookiesArg()
@@ -581,14 +612,17 @@ func searchYouTube(query string, maxResults int) []Song {
 		"--no-download",
 		"--no-playlist",
 		"--no-check-certificate",
-		"--extractor-args", "youtube:player_client=web,mweb,android",
+		"--extractor-args", "youtube:player_client=android,ios",
 	}
-	args = append(args, cookieArgs...)
+	if len(cookieArgs) > 0 {
+		args = append(cookieArgs, args...)
+	}
 	args = append(args, searchTerm)
 
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		log.Printf("[YT Search] Scraper error: %v", err)
 		return nil
 	}
 
@@ -640,6 +674,13 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	currentUser := getCurrentUser(r)
+	mu.RLock()
+	userObj, hasUser := appDB.Users[currentUser]
+	mu.RUnlock()
+	var currentUserPtr *User
+	if hasUser {
+		currentUserPtr = &userObj
+	}
 
 	switch path {
 	case "ping":
@@ -649,7 +690,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		writeSubsonicOK(w, f, map[string]interface{}{
 			"license": map[string]interface{}{
 				"valid":          true,
-				"email":          "admin@local",
+				"email":          currentUser + "@local",
 				"licenseExpires": "2099-01-01T00:00:00",
 			},
 		})
@@ -761,16 +802,22 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 
 	case "getalbum", "getmusicdirectory":
 		mu.RLock()
-		defer mu.RUnlock()
-		children := []map[string]interface{}{}
+		allSongs := make([]Song, 0, len(appDB.Songs))
 		for _, s := range appDB.Songs {
-			children = append(children, songToMap(s))
+			allSongs = append(allSongs, s)
 		}
+		mu.RUnlock()
+
+		children := make([]map[string]interface{}, 0, len(allSongs))
+		for _, s := range allSongs {
+			children = append(children, songToMap(s, currentUserPtr))
+		}
+
 		if f == "json" {
 			writeSubsonicOK(w, f, map[string]interface{}{
 				"album": map[string]interface{}{
 					"id": "al-1", "name": "Cached Songs", "artist": "Music",
-					"artistId": "ar-1", "songCount": len(appDB.Songs), "coverArt": "al-1", "song": children,
+					"artistId": "ar-1", "songCount": len(allSongs), "coverArt": "al-1", "song": children,
 				},
 				"directory": map[string]interface{}{
 					"id": "al-1", "name": "Cached Songs", "child": children,
@@ -778,8 +825,8 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			})
 		} else {
 			var b strings.Builder
-			b.WriteString(fmt.Sprintf(`<album id="al-1" name="Cached Songs" artist="Music" artistId="ar-1" songCount="%d">`, len(appDB.Songs)))
-			for _, s := range appDB.Songs {
+			b.WriteString(fmt.Sprintf(`<album id="al-1" name="Cached Songs" artist="YouTube" artistId="ar-1" songCount="%d">`, len(allSongs)))
+			for _, s := range allSongs {
 				b.WriteString(fmt.Sprintf(`<song id="%s" title="%s" artist="%s" coverArt="%s" duration="%d" playCount="%d"/>`, s.YTID, xmlEscape(s.Title), xmlEscape(s.Artist), s.YTID, s.Duration, s.PlayCount))
 			}
 			b.WriteString(`</album>`)
@@ -796,7 +843,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{"song": songToMap(song)})
+			writeSubsonicOK(w, f, map[string]interface{}{"song": songToMap(song, currentUserPtr)})
 		} else {
 			writeSubsonicOK(w, f, fmt.Sprintf(`<song id="%s" title="%s" artist="%s" coverArt="%s" duration="%d" playCount="%d"/>`, song.YTID, xmlEscape(song.Title), xmlEscape(song.Artist), song.YTID, song.Duration, song.PlayCount))
 		}
@@ -877,7 +924,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
 
-	// Search Handler with Pagination & Fast Multi-source Results
 	case "search2", "search3":
 		q := strings.TrimSpace(r.URL.Query().Get("query"))
 		qLower := strings.ToLower(q)
@@ -962,7 +1008,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 
 		songs := []map[string]interface{}{}
 		for _, s := range pagedSongs {
-			songs = append(songs, songToMap(s))
+			songs = append(songs, songToMap(s, currentUserPtr))
 		}
 
 		if f == "json" {
@@ -1011,7 +1057,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			case "recent", "recentlyplayed":
 				t, _ = time.Parse(time.RFC3339, s.LastPlayed)
 			case "starred":
-				if !s.Starred {
+				if currentUserPtr != nil && currentUserPtr.Starred != nil && !currentUserPtr.Starred[s.YTID] {
 					continue
 				}
 				t, _ = time.Parse(time.RFC3339, s.LastPlayed)
@@ -1089,7 +1135,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		out := []map[string]interface{}{}
 		for _, s := range songs {
-			out = append(out, songToMap(s))
+			out = append(out, songToMap(s, currentUserPtr))
 		}
 		if f == "json" {
 			writeSubsonicOK(w, f, map[string]interface{}{"randomSongs": map[string]interface{}{"song": out}})
@@ -1103,56 +1149,49 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			writeSubsonicOK(w, f, b.String())
 		}
 
+	// 100% User-Specific Star and Unstar
 	case "star":
 		id := r.URL.Query().Get("id")
-		mu.Lock()
-		if user, ok := appDB.Users[currentUser]; ok {
+		if id != "" && currentUser != "" {
+			mu.Lock()
+			user, ok := appDB.Users[currentUser]
+			if !ok {
+				user = User{
+					Username:  currentUser,
+					Starred:   make(map[string]bool),
+					PlayCount: make(map[string]int),
+				}
+			}
 			if user.Starred == nil {
 				user.Starred = make(map[string]bool)
 			}
 			user.Starred[id] = true
 			appDB.Users[currentUser] = user
-		} else {
-			if s, ok := appDB.Songs[id]; ok {
-				s.Starred = true
-				appDB.Songs[id] = s
-			}
+			mu.Unlock()
+			saveDB()
 		}
-		mu.Unlock()
-		saveDB()
 		writeSubsonicOK(w, f, map[string]interface{}{})
 
 	case "unstar":
 		id := r.URL.Query().Get("id")
-		mu.Lock()
-		if user, ok := appDB.Users[currentUser]; ok {
-			if user.Starred != nil {
+		if id != "" && currentUser != "" {
+			mu.Lock()
+			if user, ok := appDB.Users[currentUser]; ok && user.Starred != nil {
 				delete(user.Starred, id)
 				appDB.Users[currentUser] = user
 			}
-		} else {
-			if s, ok := appDB.Songs[id]; ok {
-				s.Starred = false
-				appDB.Songs[id] = s
-			}
+			mu.Unlock()
+			saveDB()
 		}
-		mu.Unlock()
-		saveDB()
 		writeSubsonicOK(w, f, map[string]interface{}{})
 
 	case "getstarred", "getstarred2":
 		var starred []map[string]interface{}
 		mu.RLock()
-		if user, ok := appDB.Users[currentUser]; ok && len(user.Starred) > 0 {
-			for sid := range user.Starred {
+		if currentUserPtr != nil && len(currentUserPtr.Starred) > 0 {
+			for sid := range currentUserPtr.Starred {
 				if s, ok := appDB.Songs[sid]; ok {
-					starred = append(starred, songToMap(s))
-				}
-			}
-		} else {
-			for _, s := range appDB.Songs {
-				if s.Starred {
-					starred = append(starred, songToMap(s))
+					starred = append(starred, songToMap(s, currentUserPtr))
 				}
 			}
 		}
@@ -1192,11 +1231,20 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 				s.PlayCount++
 				s.LastPlayed = time.Now().Format(time.RFC3339)
 				appDB.Songs[id] = s
-				mu.Unlock()
-				saveDB()
-			} else {
-				mu.Unlock()
 			}
+			if u, ok := appDB.Users[currentUser]; ok {
+				if u.PlayCount == nil {
+					u.PlayCount = make(map[string]int)
+				}
+				if u.LastPlayed == nil {
+					u.LastPlayed = make(map[string]string)
+				}
+				u.PlayCount[id]++
+				u.LastPlayed[id] = time.Now().Format(time.RFC3339)
+				appDB.Users[currentUser] = u
+			}
+			mu.Unlock()
+			saveDB()
 		}
 		writeSubsonicOK(w, f, map[string]interface{}{})
 
@@ -1208,6 +1256,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 				pls = append(pls, map[string]interface{}{
 					"id": p.ID, "name": p.Name, "songCount": len(p.SongIDs),
 					"created": p.Created, "changed": p.Changed, "owner": p.Owner, "public": p.Public,
+					"comment": p.YTURL,
 				})
 			}
 		}
@@ -1233,7 +1282,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		if ok {
 			for _, sid := range pl.SongIDs {
 				if s, ok := appDB.Songs[sid]; ok {
-					songs = append(songs, songToMap(s))
+					songs = append(songs, songToMap(s, currentUserPtr))
 				}
 			}
 		}
@@ -1293,6 +1342,11 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			writeSubsonicError(w, 70, "Playlist not found", f)
 			return
 		}
+		if pl.Owner != currentUser && !isAdmin(r) {
+			mu.Unlock()
+			writeSubsonicError(w, 50, "Unauthorized: Not your playlist", f)
+			return
+		}
 		if name := r.URL.Query().Get("name"); name != "" {
 			pl.Name = name
 		}
@@ -1323,13 +1377,18 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 	case "deleteplaylist":
 		id := r.URL.Query().Get("id")
 		mu.Lock()
-		delete(appDB.Playlists, id)
-		mu.Unlock()
-		saveDB()
+		pl, ok := appDB.Playlists[id]
+		if ok && (pl.Owner == currentUser || isAdmin(r)) {
+			delete(appDB.Playlists, id)
+			mu.Unlock()
+			saveDB()
+		} else {
+			mu.Unlock()
+		}
 		writeSubsonicOK(w, f, map[string]interface{}{})
 
-	// Unified Multi-Source Lyrics (JioSaavn + LRCLib)
-	case "getlyrics", "getlyricsbysongid":
+	// Clean Lyrics Handlers (Completely Eliminates Raw JSON on Amperfy)
+	case "getlyrics":
 		id := r.URL.Query().Get("id")
 		artist := r.URL.Query().Get("artist")
 		title := r.URL.Query().Get("title")
@@ -1344,6 +1403,41 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			lyrics = fetchLyrics(artist, title)
 		}
 
+		if strings.TrimSpace(lyrics) == "" {
+			writeSubsonicError(w, 70, "Lyrics not found", f)
+			return
+		}
+
+		if f == "json" {
+			writeSubsonicOK(w, f, map[string]interface{}{
+				"lyrics": map[string]interface{}{
+					"artist": artist,
+					"title":  title,
+					"value":  lyrics,
+				},
+			})
+		} else {
+			writeSubsonicOK(w, f, fmt.Sprintf(`<lyrics artist="%s" title="%s">%s</lyrics>`, xmlEscape(artist), xmlEscape(title), xmlEscape(lyrics)))
+		}
+
+	case "getlyricsbysongid":
+		id := r.URL.Query().Get("id")
+		cleanID := strings.TrimPrefix(strings.TrimPrefix(id, "al-"), "ar-")
+		if cleanID == "" {
+			writeSubsonicError(w, 10, "Missing id", f)
+			return
+		}
+
+		lyrics := getLyricsForSong(cleanID)
+		if strings.TrimSpace(lyrics) == "" {
+			writeSubsonicError(w, 70, "Lyrics not found", f)
+			return
+		}
+
+		mu.RLock()
+		s := appDB.Songs[cleanID]
+		mu.RUnlock()
+
 		var lineObjs []map[string]interface{}
 		for _, line := range strings.Split(lyrics, "\n") {
 			l := strings.TrimSpace(line)
@@ -1352,29 +1446,107 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if len(lineObjs) == 0 {
+			writeSubsonicError(w, 70, "Lyrics not found", f)
+			return
+		}
+
 		if f == "json" {
 			writeSubsonicOK(w, f, map[string]interface{}{
 				"lyricsList": map[string]interface{}{
 					"structuredLyrics": []map[string]interface{}{{
 						"lang":          "und",
-						"displayArtist": artist,
-						"displayTitle":  title,
+						"displayArtist": s.Artist,
+						"displayTitle":  s.Title,
 						"offset":        0,
 						"synced":        false,
 						"line":          lineObjs,
 					}},
 				},
-				"lyrics": map[string]interface{}{
-					"artist": artist, "title": title, "value": lyrics,
-				},
 			})
 		} else {
-			writeSubsonicOK(w, f, fmt.Sprintf(`<lyrics artist="%s" title="%s">%s</lyrics>`, xmlEscape(artist), xmlEscape(title), xmlEscape(lyrics)))
+			var b strings.Builder
+			b.WriteString(`<lyricsList><structuredLyrics lang="und" synced="false">`)
+			for _, lo := range lineObjs {
+				b.WriteString(fmt.Sprintf(`<line value="%s"/>`, xmlEscape(fmt.Sprint(lo["value"]))))
+			}
+			b.WriteString(`</structuredLyrics></lyricsList>`)
+			writeSubsonicOK(w, f, b.String())
+		}
+
+	// Subsonic User Management Endpoints
+	case "getuser":
+		username := r.URL.Query().Get("username")
+		if username == "" {
+			username = currentUser
+		}
+		mu.RLock()
+		u, exists := appDB.Users[username]
+		mu.RUnlock()
+		if !exists && username != "admin" {
+			writeSubsonicError(w, 70, "User not found", f)
+			return
+		}
+		_ = u
+		adminU, _ := getAdminCreds()
+		userMap := map[string]interface{}{
+			"username":          username,
+			"email":             username + "@local",
+			"adminRole":         username == adminU,
+			"settingsRole":      true,
+			"downloadRole":      true,
+			"uploadRole":        true,
+			"playlistRole":      true,
+			"coverArtRole":      true,
+			"commentRole":       true,
+			"podcastRole":       true,
+			"streamRole":        true,
+			"jukeboxRole":       false,
+			"shareRole":         false,
+			"scrobblingEnabled": true,
+		}
+		if f == "json" {
+			writeSubsonicOK(w, f, map[string]interface{}{"user": userMap})
+		} else {
+			writeSubsonicOK(w, f, fmt.Sprintf(`<user username="%s" email="%s@local" adminRole="%v" settingsRole="true" downloadRole="true" uploadRole="true" playlistRole="true" coverArtRole="true" commentRole="true" podcastRole="true" streamRole="true" jukeboxRole="false" shareRole="false" scrobblingEnabled="true"/>`, username, username, username == adminU))
+		}
+
+	case "getusers":
+		if !isAdmin(r) {
+			writeSubsonicError(w, 50, "Admin required", f)
+			return
+		}
+		mu.RLock()
+		var uList []map[string]interface{}
+		adminU, _ := getAdminCreds()
+		for _, u := range appDB.Users {
+			uList = append(uList, map[string]interface{}{
+				"username":     u.Username,
+				"email":        u.Username + "@local",
+				"adminRole":    u.Username == adminU,
+				"playlistRole": true,
+				"streamRole":   true,
+			})
+		}
+		mu.RUnlock()
+
+		if f == "json" {
+			writeSubsonicOK(w, f, map[string]interface{}{
+				"users": map[string]interface{}{"user": uList},
+			})
+		} else {
+			var b strings.Builder
+			b.WriteString(`<users>`)
+			for _, u := range uList {
+				b.WriteString(fmt.Sprintf(`<user username="%s" adminRole="%v"/>`, u["username"], u["adminRole"]))
+			}
+			b.WriteString(`</users>`)
+			writeSubsonicOK(w, f, b.String())
 		}
 
 	case "createuser":
 		if !isAdmin(r) {
-			writeSubsonicError(w, 50, "User is not authorized for given operation", f)
+			writeSubsonicError(w, 50, "User is not authorized", f)
 			return
 		}
 		username := strings.TrimSpace(r.URL.Query().Get("username"))
@@ -1400,40 +1572,39 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		saveDB()
 		writeSubsonicOK(w, f, map[string]interface{}{})
 
-	case "getuser":
-		username := r.URL.Query().Get("username")
+	case "changepassword":
+		username := strings.TrimSpace(r.URL.Query().Get("username"))
+		newPass := r.URL.Query().Get("password")
 		if username == "" {
 			username = currentUser
 		}
-		mu.RLock()
-		u, exists := appDB.Users[username]
-		mu.RUnlock()
-		if !exists && username != "admin" {
-			writeSubsonicError(w, 70, "User not found", f)
+		if username != currentUser && !isAdmin(r) {
+			writeSubsonicError(w, 50, "Unauthorized to change another user's password", f)
 			return
 		}
-		_ = u
-		userMap := map[string]interface{}{
-			"username":          username,
-			"email":             username + "@local",
-			"adminRole":         username == "admin",
-			"settingsRole":      true,
-			"downloadRole":      true,
-			"uploadRole":        true,
-			"playlistRole":      true,
-			"coverArtRole":      true,
-			"commentRole":       true,
-			"podcastRole":       true,
-			"streamRole":        true,
-			"jukeboxRole":       false,
-			"shareRole":         false,
-			"scrobblingEnabled": true,
+		mu.Lock()
+		if u, ok := appDB.Users[username]; ok {
+			u.Password = newPass
+			appDB.Users[username] = u
+			mu.Unlock()
+			saveDB()
+			writeSubsonicOK(w, f, map[string]interface{}{})
+			return
 		}
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{"user": userMap})
-		} else {
-			writeSubsonicOK(w, f, fmt.Sprintf(`<user username="%s" email="%s@local" adminRole="%v" settingsRole="true" downloadRole="true" uploadRole="true" playlistRole="true" coverArtRole="true" commentRole="true" podcastRole="true" streamRole="true" jukeboxRole="false" shareRole="false" scrobblingEnabled="true"/>`, username, username, username == "admin"))
+		mu.Unlock()
+		writeSubsonicError(w, 70, "User not found", f)
+
+	case "deleteuser":
+		if !isAdmin(r) {
+			writeSubsonicError(w, 50, "Admin required", f)
+			return
 		}
+		username := strings.TrimSpace(r.URL.Query().Get("username"))
+		mu.Lock()
+		delete(appDB.Users, username)
+		mu.Unlock()
+		saveDB()
+		writeSubsonicOK(w, f, map[string]interface{}{})
 
 	default:
 		writeSubsonicOK(w, f, map[string]interface{}{})
@@ -1478,6 +1649,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 
 	tmpFile := filepath.Join("/tmp", ytID+".m4a")
 	if _, err := os.Stat(tmpFile); err == nil {
+		w.Header().Set("Content-Type", "audio/mp4")
 		http.ServeFile(w, r, tmpFile)
 		return
 	}
@@ -1491,21 +1663,27 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		artist = "YouTube"
 	}
 
-	ytArgs := []string{
+	// Fixed: Best audio fallback + Android client bypasses cloud IP bot block
+	var ytArgs []string
+	if len(cookieArgs) > 0 {
+		ytArgs = append(ytArgs, cookieArgs...)
+	}
+	ytArgs = append(ytArgs,
 		"-x", "--audio-format", "m4a",
-		"-f", "ba[ext=m4a]/bestaudio",
+		"--audio-quality", "0",
+		"-f", "bestaudio/ba/b",
 		"--no-playlist",
 		"--no-check-certificate",
-		"--extractor-args", "youtube:player_client=web,mweb,android",
+		"--extractor-args", "youtube:player_client=android,ios",
 		"-o", tmpFile,
-	}
-	ytArgs = append(cookieArgs, ytArgs...)
-	ytArgs = append(ytArgs, ytUrl)
+		ytUrl,
+	)
 
 	cmd := exec.Command("yt-dlp", ytArgs...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		os.Remove(tmpFile)
+		log.Printf("[YT Stream Error] yt-dlp failed for %s: %v | Log: %s", ytUrl, err, string(out))
 		http.Error(w, fmt.Sprintf("yt-dlp error: %v\n%s", err, string(out)), 500)
 		return
 	}
@@ -1579,15 +1757,18 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 	defer cancel()
 
 	cookieArgs := getCookiesArg()
-	args := []string{
+	var args []string
+	if len(cookieArgs) > 0 {
+		args = append(args, cookieArgs...)
+	}
+	args = append(args,
 		"--flat-playlist",
 		"--print", "%(id)s|||%(title)s|||%(uploader)s",
 		"--no-download",
 		"--playlist-end", fmt.Sprintf("%d", maxVideos),
-		"--extractor-args", "youtube:player_client=web,mweb,android",
-	}
-	args = append(cookieArgs, args...)
-	args = append(args, playlistURL)
+		"--extractor-args", "youtube:player_client=android,ios",
+		playlistURL,
+	)
 
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
@@ -1754,7 +1935,7 @@ func syncAllLinkedPlaylists() {
 		return
 	}
 
-	log.Printf("[AutoSync] Mirror syncing %d YouTube playlists...", len(tasks))
+	log.Printf("[AutoSync] Mirror syncing %d YouTube playlists across all users...", len(tasks))
 	hasChanges := false
 
 	for _, t := range tasks {
@@ -1775,7 +1956,7 @@ func syncAllLinkedPlaylists() {
 	}
 }
 
-// -------------------- List & DB Endpoints --------------------
+// -------------------- User & Playlist REST Endpoints --------------------
 
 func listHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RLock()
@@ -1788,7 +1969,80 @@ func dbHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, dbPath)
 }
 
-// -------------------- User Management REST API --------------------
+func myPlaylistsHandler(w http.ResponseWriter, r *http.Request) {
+	u := getCurrentUser(r)
+	if u == "" {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+
+	mu.RLock()
+	var list []Playlist
+	for _, p := range appDB.Playlists {
+		if p.Owner == u || isAdmin(r) {
+			list = append(list, p)
+		}
+	}
+	mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+func syncSpecificPlaylistHandler(w http.ResponseWriter, r *http.Request) {
+	u := getCurrentUser(r)
+	plID := r.URL.Query().Get("id")
+
+	mu.RLock()
+	pl, exists := appDB.Playlists[plID]
+	mu.RUnlock()
+
+	if !exists {
+		http.Error(w, "Playlist not found", 404)
+		return
+	}
+	if pl.Owner != u && !isAdmin(r) {
+		http.Error(w, "Unauthorized", 403)
+		return
+	}
+	if pl.YTURL == "" {
+		http.Error(w, "Not a YouTube synced playlist", 400)
+		return
+	}
+
+	added, _, err := importOrSyncYouTubePlaylist(pl.YTURL, 50, pl.Owner, pl.Name)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	saveDB()
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok","added":%d,"message":"Synced successfully"}`, added)
+}
+
+func myFavoritesHandler(w http.ResponseWriter, r *http.Request) {
+	u := getCurrentUser(r)
+	if u == "" {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+
+	mu.RLock()
+	user, exists := appDB.Users[u]
+	var songs []Song
+	if exists && user.Starred != nil {
+		for sid := range user.Starred {
+			if s, ok := appDB.Songs[sid]; ok {
+				songs = append(songs, s)
+			}
+		}
+	}
+	mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(songs)
+}
 
 func registerUserHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1828,8 +2082,8 @@ func registerUserHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 	saveDB()
 
-	log.Printf("[Auth] New user registered: %s", req.Username)
-	fmt.Fprintf(w, `{"status":"ok","message":"registration successful","username":"%s"}`, req.Username)
+	log.Printf("[Auth] User registered: %s", req.Username)
+	fmt.Fprintf(w, `{"status":"ok","message":"Registration successful","username":"%s"}`, req.Username)
 }
 
 func listUsersHandler(w http.ResponseWriter, r *http.Request) {
@@ -1840,12 +2094,19 @@ func listUsersHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RLock()
 	defer mu.RUnlock()
 	type uinfo struct {
-		Username string `json:"username"`
-		Stars    int    `json:"stars"`
+		Username  string `json:"username"`
+		Stars     int    `json:"stars"`
+		Playlists int    `json:"playlists"`
 	}
 	var list []uinfo
 	for _, u := range appDB.Users {
-		list = append(list, uinfo{Username: u.Username, Stars: len(u.Starred)})
+		pls := 0
+		for _, p := range appDB.Playlists {
+			if p.Owner == u.Username {
+				pls++
+			}
+		}
+		list = append(list, uinfo{Username: u.Username, Stars: len(u.Starred), Playlists: pls})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"users": list})
@@ -1856,9 +2117,10 @@ func deleteUserHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Admin access required", 403)
 		return
 	}
-	username := r.URL.Query().Get("username")
-	if username == "" {
-		http.Error(w, "username is required", 400)
+	username := strings.TrimSpace(r.URL.Query().Get("username"))
+	adminU, _ := getAdminCreds()
+	if username == "" || username == adminU {
+		http.Error(w, "Cannot delete admin account", 400)
 		return
 	}
 	mu.Lock()
@@ -1884,8 +2146,10 @@ func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
 	adminUser, adminPass := getAdminCreds()
 
 	ok := false
+	isAdminRole := false
 	if user == adminUser && pass == adminPass {
 		ok = true
+		isAdminRole = true
 	} else {
 		mu.RLock()
 		if u, exists := appDB.Users[user]; exists && u.Password == pass {
@@ -1897,7 +2161,7 @@ func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if ok {
 		token := fmt.Sprintf("tok_%s_%d", user, time.Now().Unix())
-		fmt.Fprintf(w, `{"ok":true,"token":"%s","user":"%s"}`, token, user)
+		fmt.Fprintf(w, `{"ok":true,"token":"%s","user":"%s","isAdmin":%v}`, token, user, isAdminRole)
 	} else {
 		fmt.Fprintf(w, `{"ok":false,"error":"Invalid username or password"}`)
 	}
@@ -2190,7 +2454,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v20-production | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
+	fmt.Fprintf(w, "OK v22-ytfix | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
@@ -2234,6 +2498,9 @@ func main() {
 	mux.HandleFunc("/convert", playHandler)
 	mux.HandleFunc("/import/youtube-playlist", importPlaylistHandler)
 	mux.HandleFunc("/import/playlist", importPlaylistHandler)
+	mux.HandleFunc("/playlists/my", myPlaylistsHandler)
+	mux.HandleFunc("/playlists/sync", syncSpecificPlaylistHandler)
+	mux.HandleFunc("/favorites/my", myFavoritesHandler)
 	mux.HandleFunc("/admin/login", adminLoginHandler)
 	mux.HandleFunc("/users/register", registerUserHandler)
 	mux.HandleFunc("/users/create", registerUserHandler)
