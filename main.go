@@ -341,8 +341,8 @@ func songToMap(s Song) map[string]interface{} {
 		"coverArt":    s.YTID,
 		"duration":    s.Duration,
 		"bitRate":     128,
-		"suffix":      "mp3",
-		"contentType": "audio/mpeg",
+		"suffix":      "m4a",
+		"contentType": "audio/mp4",
 		"isDir":       false,
 		"playCount":   s.PlayCount,
 		"created":     s.AddedAt,
@@ -538,7 +538,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	sem <- struct{}{}
 	defer func() { <-sem }()
 
-	tmpFile := filepath.Join("/tmp", ytID+".mp3")
+	tmpFile := filepath.Join("/tmp", ytID+".m4a")
 	os.Remove(tmpFile)
 
 	cookieArgs := getCookiesArg()
@@ -551,7 +551,8 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ytArgs := []string{
-		"-x", "--audio-format", "mp3",
+		"-x", "--audio-format", "m4a",
+		"-f", "ba[ext=m4a]/bestaudio",
 		"--no-playlist",
 		"--no-check-certificate",
 		"--js-runtimes", "deno",
@@ -622,7 +623,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 	saveDB()
 
-	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Content-Type", "audio/mp4")
 	http.ServeFile(w, r, tmpFile)
 	go func() {
 		time.Sleep(45 * time.Second)
