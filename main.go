@@ -50,6 +50,7 @@ type Playlist struct {
 	Owner   string   `json:"owner"`
 	Comment string   `json:"comment"`
 	Public  bool     `json:"public"`
+	YTURL   string   `json:"yt_url,omitempty"` // For YouTube Mirror Sync
 }
 
 type User struct {
@@ -72,9 +73,10 @@ var (
 		Playlists: make(map[string]Playlist),
 		Users:     make(map[string]User),
 	}
-	mu         sync.RWMutex
-	backupLock sync.Mutex
-	sem        = make(chan struct{}, 1) // strictly limit 1 conversion at a time (saves 512MB RAM)
+	mu           sync.RWMutex
+	backupLock   sync.Mutex
+	latestFileID string
+	sem          = make(chan struct{}, 1) // strictly limit 1 conversion at a time (saves 512MB RAM)
 )
 
 const dbPath = "/tmp/db.json"
@@ -192,7 +194,8 @@ func backupDBToTelegram() {
 		} `json:"result"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&res) == nil && res.Ok {
-		log.Printf("[Telegram Backup] Synced! FileID: %s", res.Result.Document.FileID)
+		latestFileID = res.Result.Document.FileID
+		log.Printf("[Telegram Backup] Synced! FileID: %s", latestFileID)
 	}
 }
 
@@ -537,7 +540,7 @@ func searchYouTube(query string, maxResults int) []Song {
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 	}
 	args = append(cookieArgs, args...)
-	args = append(args, searchTerm)
+	args = append(searchTerm, args...)
 
 	cmd := exec.Command("yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
@@ -789,7 +792,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
 
-	// Search implementation designed for Amcfy, Symfonium & Substreamer
+	// Search handler with empty arrays for mobile player parsers (Amcfy, Symfonium)
 	case "search2", "search3":
 		q := strings.TrimSpace(r.URL.Query().Get("query"))
 		qLower := strings.ToLower(q)
@@ -844,7 +847,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			songs = append(songs, songToMap(s))
 		}
 
-		// Empty slices instead of nil prevent JSON decoder errors in mobile apps
 		emptyArtists := []map[string]interface{}{}
 		emptyAlbums := []map[string]interface{}{}
 
@@ -1458,6 +1460,222 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, tmpFile)
 }
 
+// -------------------- Multi-User True Mirror Sync --------------------
+
+func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
+	if maxVideos <= 0 {
+		maxVideos = 50
+	}
+	cookieArgs := getCookiesArg()
+	args := []string{
+		"--flat-playlist",
+		"--print", "%(id)s|||%(title)s|||%(uploader)s",
+		"--no-download",
+		"--playlist-end", fmt.Sprintf("%d", maxVideos),
+		"--js-runtimes", "node",
+		"--extractor-args", "youtube:player_client=web,mweb,android",
+	}
+	args = append(cookieArgs, args...)
+	args = append(args, playlistURL)
+
+	cmd := exec.Command("yt-dlp", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("yt-dlp error: %v", err)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	var songs []Song
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "WARNING") || strings.HasPrefix(line, "ERROR") {
+			continue
+		}
+		parts := strings.SplitN(line, "|||", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		id := strings.TrimSpace(parts[0])
+		title := strings.TrimSpace(parts[1])
+		artist := "YouTube"
+		if len(parts) >= 3 && strings.TrimSpace(parts[2]) != "" {
+			artist = strings.TrimSpace(parts[2])
+		}
+		if id == "" || title == "" {
+			continue
+		}
+		songs = append(songs, Song{
+			YTID:     id,
+			Title:    title,
+			Artist:   artist,
+			AddedAt:  now,
+			Duration: 180,
+		})
+	}
+	return songs, nil
+}
+
+func importOrSyncYouTubePlaylist(playlistURL string, maxVideos int, owner string, plName string) (int, string, error) {
+	freshSongs, err := fetchYTPlaylistSongs(playlistURL, maxVideos)
+	if err != nil {
+		return 0, "", err
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	now := time.Now().Format(time.RFC3339)
+	var currentIDs []string
+
+	addedCount := 0
+	for _, s := range freshSongs {
+		currentIDs = append(currentIDs, s.YTID)
+		if _, exists := appDB.Songs[s.YTID]; !exists {
+			appDB.Songs[s.YTID] = s
+			addedCount++
+		}
+	}
+
+	var targetPlID string
+	for id, pl := range appDB.Playlists {
+		if pl.Owner == owner && pl.YTURL == playlistURL {
+			targetPlID = id
+			break
+		}
+	}
+
+	if targetPlID != "" {
+		pl := appDB.Playlists[targetPlID]
+		if plName != "" {
+			pl.Name = plName
+		}
+		pl.SongIDs = currentIDs
+		pl.Changed = now
+		appDB.Playlists[targetPlID] = pl
+		return addedCount, targetPlID, nil
+	}
+
+	if plName == "" {
+		plName = "YT Playlist " + time.Now().Format("02 Jan 15:04")
+	}
+	targetPlID = fmt.Sprintf("pl-%d", time.Now().UnixNano())
+	appDB.Playlists[targetPlID] = Playlist{
+		ID:      targetPlID,
+		Name:    plName,
+		SongIDs: currentIDs,
+		Created: now,
+		Changed: now,
+		Owner:   owner,
+		Public:  false,
+		YTURL:   playlistURL,
+	}
+
+	return addedCount, targetPlID, nil
+}
+
+func importPlaylistHandler(w http.ResponseWriter, r *http.Request) {
+	currentUser := getCurrentUser(r)
+	if currentUser == "" {
+		adminU, adminP := getAdminCreds()
+		if r.URL.Query().Get("u") == adminU && r.URL.Query().Get("p") == adminP {
+			currentUser = adminU
+		} else {
+			http.Error(w, "Unauthorized: Login required", 401)
+			return
+		}
+	}
+
+	playlistURL := r.URL.Query().Get("url")
+	if playlistURL == "" {
+		http.Error(w, "missing url param", 400)
+		return
+	}
+
+	plName := strings.TrimSpace(r.URL.Query().Get("name"))
+	maxV := 40
+	if m := r.URL.Query().Get("max"); m != "" {
+		if v, err := strconv.Atoi(m); err == nil && v > 0 {
+			maxV = v
+		}
+	}
+
+	added, plID, err := importOrSyncYouTubePlaylist(playlistURL, maxV, currentUser, plName)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	saveDB()
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok","newSongsAdded":%d,"playlistId":"%s","owner":"%s","message":"Mirror synced with YouTube!"}`, added, plID, currentUser)
+}
+
+// -------------------- Background Mirror Sync Engine --------------------
+
+func startBackgroundSync() {
+	go func() {
+		time.Sleep(30 * time.Second)
+		for {
+			syncAllLinkedPlaylists()
+			time.Sleep(6 * time.Hour)
+		}
+	}()
+}
+
+func syncAllLinkedPlaylists() {
+	mu.RLock()
+	type plTask struct {
+		id    string
+		url   string
+		owner string
+		name  string
+	}
+	var tasks []plTask
+	for id, pl := range appDB.Playlists {
+		if pl.YTURL != "" {
+			tasks = append(tasks, plTask{id: id, url: pl.YTURL, owner: pl.Owner, name: pl.Name})
+		}
+	}
+	mu.RUnlock()
+
+	if len(tasks) == 0 {
+		return
+	}
+
+	log.Printf("[AutoSync] Mirror syncing %d YouTube playlists...", len(tasks))
+	hasChanges := false
+
+	for _, t := range tasks {
+		added, _, err := importOrSyncYouTubePlaylist(t.url, 50, t.owner, t.name)
+		if err != nil {
+			log.Printf("[AutoSync] Failed mirroring %s: %v", t.name, err)
+			continue
+		}
+		if added > 0 {
+			hasChanges = true
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	if hasChanges {
+		log.Println("[AutoSync] Changes detected during mirror sync. Uploading backup to Telegram...")
+		saveDB()
+	}
+}
+
+// -------------------- List & DB Endpoints --------------------
+
+func listHandler(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
+	defer mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(appDB.Songs)
+}
+
+func dbHandler(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, dbPath)
+}
+
 // -------------------- User Management REST API --------------------
 
 func registerUserHandler(w http.ResponseWriter, r *http.Request) {
@@ -1543,14 +1761,6 @@ func deleteUserHandler(w http.ResponseWriter, r *http.Request) {
 // -------------------- Admin Login API --------------------
 
 func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "*")
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(204)
-		return
-	}
-
 	var body struct {
 		User string `json:"user"`
 		Pass string `json:"pass"`
@@ -1777,7 +1987,7 @@ func ensureJioSongInDB(s Song) {
 	mu.Unlock()
 }
 
-// -------------------- Health & App Launch --------------------
+// -------------------- Health Handler --------------------
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RLock()
@@ -1787,34 +1997,67 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RUnlock()
 	cookies := len(getCookiesArg()) > 0
 	admin, _ := getAdminCreds()
+
+	fid := latestFileID
+	if fid == "" {
+		fid = os.Getenv("DB_JSON_FILE_ID")
+	}
+	if fid == "" {
+		fid = "Not yet generated (import playlist to sync)"
+	}
+
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v13-stable | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\n", c, pc, uc, cookies, admin)
+	fmt.Fprintf(w, "OK v15-mirrorsync | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
 }
+
+// -------------------- Global CORS Middleware --------------------
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// -------------------- App Launcher --------------------
 
 func main() {
 	loadDB()
 	startTempCleaner()
+	startBackgroundSync()
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8000"
 	}
 
+	mux := http.NewServeMux()
+
 	// Subsonic endpoints
-	http.HandleFunc("/rest/", subsonicHandler)
+	mux.HandleFunc("/rest/", subsonicHandler)
 
 	// Admin, Auth & Utility routes
-	http.HandleFunc("/", healthHandler)
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/play", playHandler)
-	http.HandleFunc("/convert", playHandler)
-	http.HandleFunc("/admin/login", adminLoginHandler)
-	http.HandleFunc("/users/register", registerUserHandler)
-	http.HandleFunc("/users/create", registerUserHandler)
-	http.HandleFunc("/users/list", listUsersHandler)
-	http.HandleFunc("/users/delete", deleteUserHandler)
+	mux.HandleFunc("/", healthHandler)
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/list", listHandler)
+	mux.HandleFunc("/db", dbHandler)
+	mux.HandleFunc("/play", playHandler)
+	mux.HandleFunc("/convert", playHandler)
+	mux.HandleFunc("/import/youtube-playlist", importPlaylistHandler)
+	mux.HandleFunc("/import/playlist", importPlaylistHandler)
+	mux.HandleFunc("/admin/login", adminLoginHandler)
+	mux.HandleFunc("/users/register", registerUserHandler)
+	mux.HandleFunc("/users/create", registerUserHandler)
+	mux.HandleFunc("/users/list", listUsersHandler)
+	mux.HandleFunc("/users/delete", deleteUserHandler)
 
 	adminUser, _ := getAdminCreds()
-	log.Printf("[Server] Running on 0.0.0.0:%s | Admin User: %s", port, adminUser)
-	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, nil))
+	log.Printf("[Server] Initialized on 0.0.0.0:%s | Admin User: %s", port, adminUser)
+	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, corsMiddleware(mux)))
 }
