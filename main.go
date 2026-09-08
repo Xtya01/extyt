@@ -76,7 +76,7 @@ var (
 	mu           sync.RWMutex
 	backupLock   sync.Mutex
 	latestFileID string
-	sem          = make(chan struct{}, 1) // strictly limit 1 conversion at a time (saves 512MB RAM)
+	sem          = make(chan struct{}, 1) // Strictly limit 1 conversion at a time (saves 512MB RAM)
 )
 
 const dbPath = "/tmp/db.json"
@@ -496,7 +496,7 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 		"--js-runtimes", "node",
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 	}
-	args = append(cookieArgs, args...)
+	args = append(args, cookieArgs...)
 	args = append(args, ytUrl)
 
 	cmd := exec.Command("yt-dlp", args...)
@@ -539,8 +539,8 @@ func searchYouTube(query string, maxResults int) []Song {
 		"--js-runtimes", "node",
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 	}
-	args = append(cookieArgs, args...)
-	args = append(searchTerm, args...)
+	args = append(args, cookieArgs...)
+	args = append(args, searchTerm) // FIX: properly appended as slice element
 
 	cmd := exec.Command("yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
@@ -792,7 +792,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
 
-	// Search handler with empty arrays for mobile player parsers (Amcfy, Symfonium)
 	case "search2", "search3":
 		q := strings.TrimSpace(r.URL.Query().Get("query"))
 		qLower := strings.ToLower(q)
@@ -1391,7 +1390,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 		"-o", tmpFile,
 	}
-	ytArgs = append(cookieArgs, ytArgs...)
+	ytArgs = append(ytArgs, cookieArgs...)
 	ytArgs = append(ytArgs, ytUrl)
 
 	cmd := exec.Command("yt-dlp", ytArgs...)
@@ -1475,7 +1474,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		"--js-runtimes", "node",
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 	}
-	args = append(cookieArgs, args...)
+	args = append(args, cookieArgs...)
 	args = append(args, playlistURL)
 
 	cmd := exec.Command("yt-dlp", args...)
