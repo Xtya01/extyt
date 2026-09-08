@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"mime/multipart"
@@ -39,6 +40,7 @@ type Song struct {
 	Starred    bool   `json:"starred"`
 	Rating     int    `json:"rating"`
 	Duration   int    `json:"duration"`
+	CoverArt   string `json:"cover_art,omitempty"`
 	Lyrics     string `json:"lyrics,omitempty"`
 }
 
@@ -77,13 +79,14 @@ var (
 	mu           sync.RWMutex
 	backupLock   sync.Mutex
 	latestFileID string
-	sem          = make(chan struct{}, 1) // Prevents RAM exhaustion on Koyeb Free (512MB)
+	searchCache  sync.Map
+	sem          = make(chan struct{}, 1)
 )
 
 const dbPath = "/tmp/db.json"
 const cookiePath = "/tmp/cookies.txt"
 
-// -------------------- Database & Telegram Persistence --------------------
+// -------------------- Database & Persistence --------------------
 
 func loadDB() {
 	mu.Lock()
@@ -445,16 +448,20 @@ func writeSubsonicOK(w http.ResponseWriter, f string, body interface{}) {
 }
 
 func songToMap(s Song) map[string]interface{} {
+	albumName := "YouTube"
+	if strings.HasPrefix(s.YTID, "js-") {
+		albumName = "JioSaavn"
+	}
 	m := map[string]interface{}{
 		"id":          s.YTID,
 		"title":       s.Title,
-		"album":       "Cached Songs",
-		"albumId":     "al-1",
+		"album":       albumName,
+		"albumId":     "al-" + s.YTID,
 		"artist":      s.Artist,
-		"artistId":    "ar-1",
+		"artistId":    "ar-" + s.YTID,
 		"coverArt":    s.YTID,
 		"duration":    s.Duration,
-		"bitRate":     128,
+		"bitRate":     320,
 		"suffix":      "m4a",
 		"contentType": "audio/mp4",
 		"isDir":       false,
@@ -474,9 +481,6 @@ func songToMap(s Song) map[string]interface{} {
 	if s.Duration == 0 {
 		m["duration"] = 180
 	}
-	if s.Artist == "" {
-		m["artist"] = "YouTube"
-	}
 	return m
 }
 
@@ -486,24 +490,20 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-// -------------------- YouTube Fast Scraper with Timeout --------------------
+// -------------------- YouTube & Search Scrapers --------------------
 
 func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	args := []string{
 		"--print", "%(title)s|||%(artist)s|||%(uploader)s",
 		"--no-download",
 		"--no-playlist",
 		"--no-check-certificate",
-		"--js-runtimes", "node",
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 	}
 	args = append(args, cookieArgs...)
 	args = append(args, ytUrl)
 
-	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	cmd := exec.Command("yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", ""
@@ -528,12 +528,11 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 	return title, artist
 }
 
-// searchYouTube with strict 3-second timeout so requests never hang
 func searchYouTube(query string, maxResults int) []Song {
 	if maxResults <= 0 {
 		maxResults = 5
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer cancel()
 
 	cookieArgs := getCookiesArg()
@@ -544,7 +543,6 @@ func searchYouTube(query string, maxResults int) []Song {
 		"--no-download",
 		"--no-playlist",
 		"--no-check-certificate",
-		"--js-runtimes", "node",
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 	}
 	args = append(args, cookieArgs...)
@@ -577,10 +575,11 @@ func searchYouTube(query string, maxResults int) []Song {
 		}
 		results = append(results, Song{
 			YTID:     id,
-			Title:    title,
+			Title:    title + " [YT]",
 			Artist:   artist,
 			AddedAt:  time.Now().Format(time.RFC3339),
 			Duration: 180,
+			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
 		})
 	}
 	return results
@@ -628,19 +627,18 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			writeSubsonicOK(w, f, `<musicFolders><musicFolder id="1" name="Cloud Library"/></musicFolders>`)
 		}
 
-	// Amperfy calls getGenres on Home Tab load
 	case "getgenres":
 		genres := []map[string]interface{}{
+			{"value": "Hindi", "songCount": len(appDB.Songs), "albumCount": 1},
+			{"value": "Punjabi", "songCount": len(appDB.Songs), "albumCount": 1},
 			{"value": "Pop", "songCount": len(appDB.Songs), "albumCount": 1},
-			{"value": "Bollywood", "songCount": len(appDB.Songs), "albumCount": 1},
-			{"value": "International", "songCount": len(appDB.Songs), "albumCount": 1},
 		}
 		if f == "json" {
 			writeSubsonicOK(w, f, map[string]interface{}{
 				"genres": map[string]interface{}{"genre": genres},
 			})
 		} else {
-			writeSubsonicOK(w, f, `<genres><genre value="Pop"/><genre value="Bollywood"/></genres>`)
+			writeSubsonicOK(w, f, `<genres><genre value="Hindi"/><genre value="Punjabi"/></genres>`)
 		}
 
 	case "getpodcasts":
@@ -658,7 +656,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		for _, s := range appDB.Songs {
 			a := s.Artist
 			if a == "" {
-				a = "YouTube"
+				a = "Music"
 			}
 			artistMap[a]++
 		}
@@ -733,7 +731,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		if f == "json" {
 			writeSubsonicOK(w, f, map[string]interface{}{
 				"album": map[string]interface{}{
-					"id": "al-1", "name": "Cached Songs", "artist": "YouTube",
+					"id": "al-1", "name": "Cached Songs", "artist": "Music",
 					"artistId": "ar-1", "songCount": len(appDB.Songs), "coverArt": "al-1", "song": children,
 				},
 				"directory": map[string]interface{}{
@@ -742,7 +740,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			})
 		} else {
 			var b strings.Builder
-			b.WriteString(fmt.Sprintf(`<album id="al-1" name="Cached Songs" artist="YouTube" artistId="ar-1" songCount="%d">`, len(appDB.Songs)))
+			b.WriteString(fmt.Sprintf(`<album id="al-1" name="Cached Songs" artist="Music" artistId="ar-1" songCount="%d">`, len(appDB.Songs)))
 			for _, s := range appDB.Songs {
 				b.WriteString(fmt.Sprintf(`<song id="%s" title="%s" artist="%s" coverArt="%s" duration="%d" playCount="%d"/>`, s.YTID, xmlEscape(s.Title), xmlEscape(s.Artist), s.YTID, s.Duration, s.PlayCount))
 			}
@@ -812,22 +810,50 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		r.URL = &newURL
 		playHandler(w, r)
 
+	// Fixed High-Res Cover Art for Both JioSaavn & YouTube
 	case "getcoverart":
 		id := r.URL.Query().Get("id")
-		if len(id) >= 11 {
-			if len(id) > 11 {
-				id = id[len(id)-11:]
-			}
-			http.Redirect(w, r, "https://i.ytimg.com/vi/"+id+"/hqdefault.jpg", 302)
+		cleanID := strings.TrimPrefix(strings.TrimPrefix(id, "al-"), "ar-")
+
+		mu.RLock()
+		s, ok := appDB.Songs[cleanID]
+		mu.RUnlock()
+
+		if ok && s.CoverArt != "" {
+			http.Redirect(w, r, s.CoverArt, 302)
 			return
 		}
+
+		if strings.HasPrefix(cleanID, "js-") {
+			// Resolve live JioSaavn artwork
+			imgURL := getJioCoverArt(cleanID)
+			if imgURL != "" {
+				http.Redirect(w, r, imgURL, 302)
+				return
+			}
+		}
+
+		if len(cleanID) == 11 && !strings.HasPrefix(cleanID, "js-") {
+			http.Redirect(w, r, "https://i.ytimg.com/vi/"+cleanID+"/hqdefault.jpg", 302)
+			return
+		}
+
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
 
-	// Fast Search for Amperfy (JioSaavn 400ms + YouTube 3s Timeout)
+	// Fast Search with In-Memory Cache + Title Badges
 	case "search2", "search3":
 		q := strings.TrimSpace(r.URL.Query().Get("query"))
 		qLower := strings.ToLower(q)
+
+		if val, cached := searchCache.Load(qLower); cached {
+			songs := val.([]map[string]interface{})
+			if f == "json" {
+				searchObj := map[string]interface{}{"artist": []interface{}{}, "album": []interface{}{}, "song": songs}
+				writeSubsonicOK(w, f, map[string]interface{}{"searchResult2": searchObj, "searchResult3": searchObj})
+				return
+			}
+		}
 
 		mu.RLock()
 		var matched []Song
@@ -849,12 +875,10 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			var ytResults []Song
 
 			wg.Add(2)
-			// Fast JioSaavn search (400ms)
 			go func() {
 				defer wg.Done()
 				jioResults = searchJioSaavn(q, 10)
 			}()
-			// YouTube with 3-second hard timeout
 			go func() {
 				defer wg.Done()
 				ytResults = searchYouTube(q, 5)
@@ -865,7 +889,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 				if !seen[js.YTID] {
 					matched = append(matched, js)
 					seen[js.YTID] = true
-					go ensureJioSongInDB(js)
+					go ensureSongInDB(js)
 				}
 			}
 			for _, ys := range ytResults {
@@ -878,28 +902,16 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		songs := []map[string]interface{}{}
-		artistsMap := make(map[string]bool)
-		albumsList := []map[string]interface{}{}
-		artistsList := []map[string]interface{}{}
-
 		for _, s := range matched {
 			songs = append(songs, songToMap(s))
-			if !artistsMap[s.Artist] {
-				artistsMap[s.Artist] = true
-				arId := "ar-" + s.YTID
-				artistsList = append(artistsList, map[string]interface{}{
-					"id": arId, "name": s.Artist, "albumCount": 1, "coverArt": s.YTID,
-				})
-			}
-			albumsList = append(albumsList, map[string]interface{}{
-				"id": "al-" + s.YTID, "name": s.Title, "artist": s.Artist, "songCount": 1, "coverArt": s.YTID,
-			})
 		}
+
+		searchCache.Store(qLower, songs)
 
 		if f == "json" {
 			searchObj := map[string]interface{}{
-				"artist": artistsList,
-				"album":  albumsList,
+				"artist": []interface{}{},
+				"album":  []interface{}{},
 				"song":   songs,
 			}
 			writeSubsonicOK(w, f, map[string]interface{}{
@@ -1259,54 +1271,48 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		saveDB()
 		writeSubsonicOK(w, f, map[string]interface{}{})
 
-	case "getlyrics":
+	// Accurate Multi-Source Lyrics (JioSaavn + LRCLib)
+	case "getlyrics", "getlyricsbysongid":
+		id := r.URL.Query().Get("id")
 		artist := r.URL.Query().Get("artist")
 		title := r.URL.Query().Get("title")
-		id := r.URL.Query().Get("id")
+
+		cleanID := strings.TrimPrefix(strings.TrimPrefix(id, "al-"), "ar-")
+
 		var lyrics string
-		if id != "" {
-			lyrics = getLyricsForSong(id)
-		} else {
+		if cleanID != "" {
+			lyrics = getLyricsForSong(cleanID)
+		}
+		if lyrics == "" && title != "" {
 			lyrics = fetchLyrics(artist, title)
 		}
+
+		var lineObjs []map[string]interface{}
+		for _, line := range strings.Split(lyrics, "\n") {
+			l := strings.TrimSpace(line)
+			if l != "" {
+				lineObjs = append(lineObjs, map[string]interface{}{"value": l})
+			}
+		}
+
 		if f == "json" {
 			writeSubsonicOK(w, f, map[string]interface{}{
+				"lyricsList": map[string]interface{}{
+					"structuredLyrics": []map[string]interface{}{{
+						"lang":          "und",
+						"displayArtist": artist,
+						"displayTitle":  title,
+						"offset":        0,
+						"synced":        false,
+						"line":          lineObjs,
+					}},
+				},
 				"lyrics": map[string]interface{}{
 					"artist": artist, "title": title, "value": lyrics,
 				},
 			})
 		} else {
 			writeSubsonicOK(w, f, fmt.Sprintf(`<lyrics artist="%s" title="%s">%s</lyrics>`, xmlEscape(artist), xmlEscape(title), xmlEscape(lyrics)))
-		}
-
-	case "getlyricsbysongid":
-		id := r.URL.Query().Get("id")
-		if id == "" {
-			writeSubsonicError(w, 10, "Missing id", f)
-			return
-		}
-		lyrics := getLyricsForSong(id)
-		mu.RLock()
-		s := appDB.Songs[id]
-		mu.RUnlock()
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"lyricsList": map[string]interface{}{
-					"structuredLyrics": []map[string]interface{}{{
-						"lang":          "en",
-						"displayArtist": s.Artist,
-						"displayTitle":  s.Title,
-						"offset":        0,
-						"synced":        false,
-						"line":          []map[string]interface{}{{"value": lyrics}},
-					}},
-				},
-				"lyrics": map[string]interface{}{
-					"artist": s.Artist, "title": s.Title, "value": lyrics,
-				},
-			})
-		} else {
-			writeSubsonicOK(w, f, fmt.Sprintf(`<lyrics artist="%s" title="%s">%s</lyrics>`, xmlEscape(s.Artist), xmlEscape(s.Title), xmlEscape(lyrics)))
 		}
 
 	case "createuser":
@@ -1433,7 +1439,6 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		"-f", "ba[ext=m4a]/bestaudio",
 		"--no-playlist",
 		"--no-check-certificate",
-		"--js-runtimes", "node",
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 		"-o", tmpFile,
 	}
@@ -1489,11 +1494,12 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	existing := appDB.Songs[ytID]
 	s := Song{
-		YTID: ytID, Title: title, Artist: artist,
+		YTID: ytID, Title: title + " [YT]", Artist: artist,
 		FileID: fileID, FilePath: fp,
 		AddedAt: existing.AddedAt, PlayCount: existing.PlayCount + 1,
 		LastPlayed: now, Starred: existing.Starred, Rating: existing.Rating,
 		Duration: existing.Duration,
+		CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", ytID),
 	}
 	if s.AddedAt == "" {
 		s.AddedAt = now
@@ -1521,7 +1527,6 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		"--print", "%(id)s|||%(title)s|||%(uploader)s",
 		"--no-download",
 		"--playlist-end", fmt.Sprintf("%d", maxVideos),
-		"--js-runtimes", "node",
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 	}
 	args = append(args, cookieArgs...)
@@ -1555,10 +1560,11 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		}
 		songs = append(songs, Song{
 			YTID:     id,
-			Title:    title,
+			Title:    title + " [YT]",
 			Artist:   artist,
 			AddedAt:  now,
 			Duration: 180,
+			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
 		})
 	}
 	return songs, nil
@@ -1840,21 +1846,44 @@ func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// -------------------- Lyrics Provider --------------------
+// -------------------- JioSaavn Lyrics + LRCLib Fallback --------------------
 
-func fetchLyrics(artist, title string) string {
-	if title == "" {
+func fetchJioLyrics(jioID string) string {
+	cleanID := strings.TrimPrefix(jioID, "js-")
+	apiURL := fmt.Sprintf("%s/lyrics?id=%s", jioAPI, cleanID)
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(apiURL)
+	if err != nil {
 		return ""
 	}
+	defer resp.Body.Close()
+
+	var res struct {
+		Status string `json:"status"`
+		Data   struct {
+			Lyrics string `json:"lyrics"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&res) == nil && (res.Status == "SUCCESS" || res.Status == "success") {
+		raw := res.Data.Lyrics
+		raw = strings.ReplaceAll(raw, "<br>", "\n")
+		raw = strings.ReplaceAll(raw, "<br/>", "\n")
+		raw = strings.ReplaceAll(raw, "<br />", "\n")
+		return html.UnescapeString(strings.TrimSpace(raw))
+	}
+	return ""
+}
+
+func fetchLyrics(artist, title string) string {
 	clean := title
-	for _, cut := range []string{"(Official Video)", "(Official Audio)", "(Lyrics)", "(Audio)", "[Official Video]", "|", " - Topic"} {
+	for _, cut := range []string{"(Official Video)", "(Official Audio)", "(Lyrics)", "(Audio)", "[Official Video]", "|", " - Topic", "[Jio]", "[YT]"} {
 		clean = strings.ReplaceAll(clean, cut, "")
 	}
 	clean = strings.TrimSpace(clean)
 
-	client := &http.Client{Timeout: 6 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 	q := url.QueryEscape(clean)
-	if artist != "" && artist != "YouTube" {
+	if artist != "" && artist != "YouTube" && artist != "JioSaavn" {
 		q = url.QueryEscape(artist + " " + clean)
 	}
 	resp, err := client.Get("https://lrclib.net/api/search?q=" + q)
@@ -1882,7 +1911,15 @@ func getLyricsForSong(id string) string {
 	if s.Lyrics != "" {
 		return s.Lyrics
 	}
-	lyrics := fetchLyrics(s.Artist, s.Title)
+
+	var lyrics string
+	if strings.HasPrefix(id, "js-") {
+		lyrics = fetchJioLyrics(id)
+	}
+	if lyrics == "" {
+		lyrics = fetchLyrics(s.Artist, s.Title)
+	}
+
 	if lyrics != "" {
 		mu.Lock()
 		if song, ok := appDB.Songs[id]; ok {
@@ -1936,6 +1973,21 @@ func decryptJioURL(encrypted string) string {
 	return urlStr
 }
 
+func parseJioImage(raw json.RawMessage) string {
+	var str string
+	if err := json.Unmarshal(raw, &str); err == nil && str != "" {
+		return strings.Replace(strings.Replace(str, "150x150", "500x500", 1), "50x50", "500x500", 1)
+	}
+	var arr []struct {
+		Quality string `json:"quality"`
+		URL     string `json:"url"`
+	}
+	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+		return arr[len(arr)-1].URL
+	}
+	return ""
+}
+
 func searchJioSaavn(query string, limit int) []Song {
 	if limit <= 0 {
 		limit = 8
@@ -1951,9 +2003,10 @@ func searchJioSaavn(query string, limit int) []Song {
 	var result struct {
 		Data struct {
 			Results []struct {
-				ID       string `json:"id"`
-				Title    string `json:"title"`
-				Subtitle string `json:"subtitle"`
+				ID       string          `json:"id"`
+				Title    string          `json:"title"`
+				Subtitle string          `json:"subtitle"`
+				Image    json.RawMessage `json:"image"`
 				MoreInfo struct {
 					Music    string `json:"music"`
 					Duration string `json:"duration"`
@@ -1984,15 +2037,42 @@ func searchJioSaavn(query string, limit int) []Song {
 		if d, err := strconv.Atoi(r.MoreInfo.Duration); err == nil && d > 0 {
 			dur = d
 		}
+		img := parseJioImage(r.Image)
+
+		cleanTitle := html.UnescapeString(r.Title)
 		songs = append(songs, Song{
 			YTID:     "js-" + r.ID,
-			Title:    r.Title,
-			Artist:   artist,
+			Title:    cleanTitle + " [Jio]",
+			Artist:   html.UnescapeString(artist),
 			AddedAt:  time.Now().Format(time.RFC3339),
 			Duration: dur,
+			CoverArt: img,
 		})
 	}
 	return songs
+}
+
+func getJioCoverArt(jioID string) string {
+	id := strings.TrimPrefix(jioID, "js-")
+	apiURL := fmt.Sprintf("%s/songs?id=%s", jioAPI, url.QueryEscape(id))
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(apiURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Data struct {
+			Songs []struct {
+				Image json.RawMessage `json:"image"`
+			} `json:"songs"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&result) == nil && len(result.Data.Songs) > 0 {
+		return parseJioImage(result.Data.Songs[0].Image)
+	}
+	return ""
 }
 
 func getJioStreamURL(jioID string) string {
@@ -2023,17 +2103,6 @@ func getJioStreamURL(jioID string) string {
 		return u
 	}
 	return mi.Vlink
-}
-
-func ensureJioSongInDB(s Song) {
-	mu.Lock()
-	if _, exists := appDB.Songs[s.YTID]; !exists {
-		appDB.Songs[s.YTID] = s
-		mu.Unlock()
-		saveDB()
-		return
-	}
-	mu.Unlock()
 }
 
 func ensureSongInDB(s Song) {
@@ -2067,7 +2136,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v16-fastsearch | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
+	fmt.Fprintf(w, "OK v17-mediafix | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
