@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/des"
 	"crypto/md5"
 	"encoding/base64"
@@ -50,7 +51,7 @@ type Playlist struct {
 	Owner   string   `json:"owner"`
 	Comment string   `json:"comment"`
 	Public  bool     `json:"public"`
-	YTURL   string   `json:"yt_url,omitempty"` // For YouTube Mirror Sync
+	YTURL   string   `json:"yt_url,omitempty"`
 }
 
 type User struct {
@@ -76,7 +77,7 @@ var (
 	mu           sync.RWMutex
 	backupLock   sync.Mutex
 	latestFileID string
-	sem          = make(chan struct{}, 1) // Strictly limit 1 conversion at a time (saves 512MB RAM)
+	sem          = make(chan struct{}, 1) // Prevents RAM exhaustion on Koyeb Free (512MB)
 )
 
 const dbPath = "/tmp/db.json"
@@ -485,9 +486,12 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-// -------------------- YouTube & Search Scrapers --------------------
+// -------------------- YouTube Fast Scraper with Timeout --------------------
 
 func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	args := []string{
 		"--print", "%(title)s|||%(artist)s|||%(uploader)s",
 		"--no-download",
@@ -499,7 +503,7 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 	args = append(args, cookieArgs...)
 	args = append(args, ytUrl)
 
-	cmd := exec.Command("yt-dlp", args...)
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", ""
@@ -524,10 +528,14 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 	return title, artist
 }
 
+// searchYouTube with strict 3-second timeout so requests never hang
 func searchYouTube(query string, maxResults int) []Song {
 	if maxResults <= 0 {
 		maxResults = 5
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
 	cookieArgs := getCookiesArg()
 	searchTerm := fmt.Sprintf("ytsearch%d:%s", maxResults, query)
 
@@ -540,9 +548,9 @@ func searchYouTube(query string, maxResults int) []Song {
 		"--extractor-args", "youtube:player_client=web,mweb,android",
 	}
 	args = append(args, cookieArgs...)
-	args = append(args, searchTerm) // FIX: properly appended as slice element
+	args = append(args, searchTerm)
 
-	cmd := exec.Command("yt-dlp", args...)
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil
@@ -618,6 +626,30 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			})
 		} else {
 			writeSubsonicOK(w, f, `<musicFolders><musicFolder id="1" name="Cloud Library"/></musicFolders>`)
+		}
+
+	// Amperfy calls getGenres on Home Tab load
+	case "getgenres":
+		genres := []map[string]interface{}{
+			{"value": "Pop", "songCount": len(appDB.Songs), "albumCount": 1},
+			{"value": "Bollywood", "songCount": len(appDB.Songs), "albumCount": 1},
+			{"value": "International", "songCount": len(appDB.Songs), "albumCount": 1},
+		}
+		if f == "json" {
+			writeSubsonicOK(w, f, map[string]interface{}{
+				"genres": map[string]interface{}{"genre": genres},
+			})
+		} else {
+			writeSubsonicOK(w, f, `<genres><genre value="Pop"/><genre value="Bollywood"/></genres>`)
+		}
+
+	case "getpodcasts":
+		if f == "json" {
+			writeSubsonicOK(w, f, map[string]interface{}{
+				"podcasts": map[string]interface{}{"channel": []interface{}{}},
+			})
+		} else {
+			writeSubsonicOK(w, f, `<podcasts/>`)
 		}
 
 	case "getindexes", "getartists":
@@ -792,6 +824,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
 
+	// Fast Search for Amperfy (JioSaavn 400ms + YouTube 3s Timeout)
 	case "search2", "search3":
 		q := strings.TrimSpace(r.URL.Query().Get("query"))
 		qLower := strings.ToLower(q)
@@ -816,10 +849,12 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			var ytResults []Song
 
 			wg.Add(2)
+			// Fast JioSaavn search (400ms)
 			go func() {
 				defer wg.Done()
-				jioResults = searchJioSaavn(q, 8)
+				jioResults = searchJioSaavn(q, 10)
 			}()
+			// YouTube with 3-second hard timeout
 			go func() {
 				defer wg.Done()
 				ytResults = searchYouTube(q, 5)
@@ -837,22 +872,34 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 				if !seen[ys.YTID] {
 					matched = append(matched, ys)
 					seen[ys.YTID] = true
+					go ensureSongInDB(ys)
 				}
 			}
 		}
 
 		songs := []map[string]interface{}{}
+		artistsMap := make(map[string]bool)
+		albumsList := []map[string]interface{}{}
+		artistsList := []map[string]interface{}{}
+
 		for _, s := range matched {
 			songs = append(songs, songToMap(s))
+			if !artistsMap[s.Artist] {
+				artistsMap[s.Artist] = true
+				arId := "ar-" + s.YTID
+				artistsList = append(artistsList, map[string]interface{}{
+					"id": arId, "name": s.Artist, "albumCount": 1, "coverArt": s.YTID,
+				})
+			}
+			albumsList = append(albumsList, map[string]interface{}{
+				"id": "al-" + s.YTID, "name": s.Title, "artist": s.Artist, "songCount": 1, "coverArt": s.YTID,
+			})
 		}
-
-		emptyArtists := []map[string]interface{}{}
-		emptyAlbums := []map[string]interface{}{}
 
 		if f == "json" {
 			searchObj := map[string]interface{}{
-				"artist": emptyArtists,
-				"album":  emptyAlbums,
+				"artist": artistsList,
+				"album":  albumsList,
 				"song":   songs,
 			}
 			writeSubsonicOK(w, f, map[string]interface{}{
@@ -1465,6 +1512,9 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 	if maxVideos <= 0 {
 		maxVideos = 50
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
 	cookieArgs := getCookiesArg()
 	args := []string{
 		"--flat-playlist",
@@ -1477,7 +1527,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 	args = append(args, cookieArgs...)
 	args = append(args, playlistURL)
 
-	cmd := exec.Command("yt-dlp", args...)
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("yt-dlp error: %v", err)
@@ -1888,10 +1938,10 @@ func decryptJioURL(encrypted string) string {
 
 func searchJioSaavn(query string, limit int) []Song {
 	if limit <= 0 {
-		limit = 6
+		limit = 8
 	}
 	apiURL := fmt.Sprintf("%s/search?query=%s", jioAPI, url.QueryEscape(query))
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(apiURL)
 	if err != nil {
 		return nil
@@ -1948,7 +1998,7 @@ func searchJioSaavn(query string, limit int) []Song {
 func getJioStreamURL(jioID string) string {
 	id := strings.TrimPrefix(jioID, "js-")
 	apiURL := fmt.Sprintf("%s/songs?id=%s", jioAPI, url.QueryEscape(id))
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 4 * time.Second}
 	resp, err := client.Get(apiURL)
 	if err != nil {
 		return ""
@@ -1986,6 +2036,17 @@ func ensureJioSongInDB(s Song) {
 	mu.Unlock()
 }
 
+func ensureSongInDB(s Song) {
+	mu.Lock()
+	if _, exists := appDB.Songs[s.YTID]; !exists {
+		appDB.Songs[s.YTID] = s
+		mu.Unlock()
+		saveDB()
+		return
+	}
+	mu.Unlock()
+}
+
 // -------------------- Health Handler --------------------
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -2006,7 +2067,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v15-mirrorsync | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
+	fmt.Fprintf(w, "OK v16-fastsearch | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
