@@ -86,7 +86,7 @@ var (
 const dbPath = "/tmp/db.json"
 const cookiePath = "/tmp/cookies.txt"
 
-// -------------------- Database & Persistence --------------------
+// -------------------- Database & Telegram Persistence --------------------
 
 func loadDB() {
 	mu.Lock()
@@ -147,7 +147,9 @@ func saveDB() {
 }
 
 func backupDBToTelegram() {
-	backupLock.Lock()
+	if !backupLock.TryLock() {
+		return // Avoid stacking backup requests
+	}
 	defer backupLock.Unlock()
 
 	token := os.Getenv("BOT_TOKEN")
@@ -490,9 +492,12 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-// -------------------- YouTube & Search Scrapers --------------------
+// -------------------- YouTube Fast Scrapers --------------------
 
 func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
 	args := []string{
 		"--print", "%(title)s|||%(artist)s|||%(uploader)s",
 		"--no-download",
@@ -503,7 +508,7 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 	args = append(args, cookieArgs...)
 	args = append(args, ytUrl)
 
-	cmd := exec.Command("yt-dlp", args...)
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", ""
@@ -530,7 +535,7 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 
 func searchYouTube(query string, maxResults int) []Song {
 	if maxResults <= 0 {
-		maxResults = 5
+		maxResults = 4
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer cancel()
@@ -740,7 +745,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			})
 		} else {
 			var b strings.Builder
-			b.WriteString(fmt.Sprintf(`<album id="al-1" name="Cached Songs" artist="Music" artistId="ar-1" songCount="%d">`, len(appDB.Songs)))
+			b.WriteString(fmt.Sprintf(`<album id="al-1" name="Cached Songs" artist="YouTube" artistId="ar-1" songCount="%d">`, len(appDB.Songs)))
 			for _, s := range appDB.Songs {
 				b.WriteString(fmt.Sprintf(`<song id="%s" title="%s" artist="%s" coverArt="%s" duration="%d" playCount="%d"/>`, s.YTID, xmlEscape(s.Title), xmlEscape(s.Artist), s.YTID, s.Duration, s.PlayCount))
 			}
@@ -770,9 +775,9 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// FIXED: No deadlock here anymore
 		go func(sid, uname string) {
 			mu.Lock()
-			defer mu.Unlock()
 			now := time.Now().Format(time.RFC3339)
 			if s, ok := appDB.Songs[sid]; ok {
 				s.PlayCount++
@@ -790,6 +795,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 				u.LastPlayed[sid] = now
 				appDB.Users[uname] = u
 			}
+			mu.Unlock() // Unlocked BEFORE calling saveDB!
 			saveDB()
 		}(id, currentUser)
 
@@ -810,7 +816,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		r.URL = &newURL
 		playHandler(w, r)
 
-	// Fixed High-Res Cover Art for Both JioSaavn & YouTube
 	case "getcoverart":
 		id := r.URL.Query().Get("id")
 		cleanID := strings.TrimPrefix(strings.TrimPrefix(id, "al-"), "ar-")
@@ -825,7 +830,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if strings.HasPrefix(cleanID, "js-") {
-			// Resolve live JioSaavn artwork
 			imgURL := getJioCoverArt(cleanID)
 			if imgURL != "" {
 				http.Redirect(w, r, imgURL, 302)
@@ -841,7 +845,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
 
-	// Fast Search with In-Memory Cache + Title Badges
 	case "search2", "search3":
 		q := strings.TrimSpace(r.URL.Query().Get("query"))
 		qLower := strings.ToLower(q)
@@ -881,7 +884,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			}()
 			go func() {
 				defer wg.Done()
-				ytResults = searchYouTube(q, 5)
+				ytResults = searchYouTube(q, 4)
 			}()
 			wg.Wait()
 
@@ -889,14 +892,14 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 				if !seen[js.YTID] {
 					matched = append(matched, js)
 					seen[js.YTID] = true
-					go ensureSongInDB(js)
+					ensureSongInMemory(js)
 				}
 			}
 			for _, ys := range ytResults {
 				if !seen[ys.YTID] {
 					matched = append(matched, ys)
 					seen[ys.YTID] = true
-					go ensureSongInDB(ys)
+					ensureSongInMemory(ys)
 				}
 			}
 		}
@@ -1271,7 +1274,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		saveDB()
 		writeSubsonicOK(w, f, map[string]interface{}{})
 
-	// Accurate Multi-Source Lyrics (JioSaavn + LRCLib)
 	case "getlyrics", "getlyricsbysongid":
 		id := r.URL.Query().Get("id")
 		artist := r.URL.Query().Get("artist")
@@ -1846,7 +1848,7 @@ func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// -------------------- JioSaavn Lyrics + LRCLib Fallback --------------------
+// -------------------- Lyrics Provider --------------------
 
 func fetchJioLyrics(jioID string) string {
 	cleanID := strings.TrimPrefix(jioID, "js-")
@@ -2105,15 +2107,13 @@ func getJioStreamURL(jioID string) string {
 	return mi.Vlink
 }
 
-func ensureSongInDB(s Song) {
+// In-Memory cache without triggering Telegram uploads on search
+func ensureSongInMemory(s Song) {
 	mu.Lock()
+	defer mu.Unlock()
 	if _, exists := appDB.Songs[s.YTID]; !exists {
 		appDB.Songs[s.YTID] = s
-		mu.Unlock()
-		saveDB()
-		return
 	}
-	mu.Unlock()
 }
 
 // -------------------- Health Handler --------------------
@@ -2136,7 +2136,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v17-mediafix | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
+	fmt.Fprintf(w, "OK v18-unlocked | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
