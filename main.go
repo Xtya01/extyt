@@ -70,6 +70,11 @@ type AppDB struct {
 	Users     map[string]User     `json:"users"`
 }
 
+type cacheEntry struct {
+	songs     []Song
+	expiresAt time.Time
+}
+
 var (
 	appDB = AppDB{
 		Songs:     make(map[string]Song),
@@ -82,7 +87,8 @@ var (
 	hasCookies   bool
 	latestFileID string
 	searchCache  sync.Map
-	sem          = make(chan struct{}, 1) // Prevents RAM exhaustion on Koyeb Free (512MB)
+	sem          = make(chan struct{}, 2) // Increased from 1 to 2
+	lastBackup   time.Time
 )
 
 const dbPath = "/tmp/db.json"
@@ -240,6 +246,12 @@ func backupDBToTelegram() {
 		return
 	}
 	defer backupLock.Unlock()
+
+	// Rate limit: minimum 45 seconds between backups
+	if time.Since(lastBackup) < 45*time.Second {
+		return
+	}
+	lastBackup = time.Now()
 
 	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
 	chatID := strings.TrimSpace(os.Getenv("CHANNEL_ID"))
@@ -606,6 +618,26 @@ func xmlEscape(s string) string {
 	var b bytes.Buffer
 	xml.EscapeText(&b, []byte(s))
 	return b.String()
+}
+
+// -------------------- Search Cache Helpers --------------------
+
+func getCachedSearch(query string) ([]Song, bool) {
+	if val, ok := searchCache.Load(query); ok {
+		entry := val.(cacheEntry)
+		if time.Now().Before(entry.expiresAt) {
+			return entry.songs, true
+		}
+		searchCache.Delete(query)
+	}
+	return nil, false
+}
+
+func setCachedSearch(query string, songs []Song) {
+	searchCache.Store(query, cacheEntry{
+		songs:     songs,
+		expiresAt: time.Now().Add(45 * time.Minute),
+	})
 }
 
 // -------------------- YouTube Engine (Search & Exact Duration) --------------------
@@ -1041,8 +1073,8 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var allMatched []Song
-		if val, cached := searchCache.Load(qLower); cached {
-			allMatched = val.([]Song)
+		if cachedSongs, ok := getCachedSearch(qLower); ok {
+			allMatched = cachedSongs
 		} else {
 			mu.RLock()
 			for _, s := range appDB.Songs {
@@ -1088,7 +1120,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			searchCache.Store(qLower, allMatched)
+			setCachedSearch(qLower, allMatched)
 		}
 
 		totalSongs := len(allMatched)
@@ -1747,7 +1779,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 
 	targetFile := filepath.Join("/tmp", ytID+".m4a")
 
-	// 2. Instant stream if cached in local disk (/tmp)
+	// 2. Instant stream if cached in local disk
 	if _, err := os.Stat(targetFile); err == nil {
 		w.Header().Set("Content-Type", "audio/mp4")
 		http.ServeFile(w, r, targetFile)
@@ -1765,26 +1797,28 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 
 	cookieArgs := getCookiesArg()
 
-	execCtx, execCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	execCtx, execCancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer execCancel()
 
 	outputTemplate := filepath.Join("/tmp", ytID+".%(ext)s")
 
-	// Formats compatible with browser cookies & bypasses datacenter blocks
 	var ytArgs []string
 	if len(cookieArgs) > 0 {
 		ytArgs = append(ytArgs, cookieArgs...)
 	}
+
+	// Improved format + clients
 	ytArgs = append(ytArgs,
-		"-f", "ba/ba*/b",
+		"-f", "bestaudio[ext=m4a]/bestaudio/best",
 		"-x", "--audio-format", "m4a",
 		"--audio-quality", "0",
 		"--no-playlist",
 		"--no-check-certificate",
 		"--no-warnings",
 		"--geo-bypass",
-		"--socket-timeout", "15",
-		"--extractor-args", "youtube:player_client=mweb,web,android",
+		"--socket-timeout", "20",
+		"--retries", "3",
+		"--extractor-args", "youtube:player_client=android,web,mweb,ios",
 		"-o", outputTemplate,
 		"https://www.youtube.com/watch?v="+ytID,
 	)
@@ -1793,22 +1827,22 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("[YT Stream Error] yt-dlp failed for %s: %v | Log: %s", ytID, err, string(out))
-		http.Error(w, fmt.Sprintf("yt-dlp error: %v\n%s", err, string(out)), 500)
+		http.Error(w, "Audio extraction failed. Please try again later.", 500)
 		return
 	}
 
-	// Smart file locator: Auto-fixes double extension (.m4a.m4a or .webm)
+	// Smart file locator
 	matches, _ := filepath.Glob(filepath.Join("/tmp", ytID+"*"))
 	var foundFile string
 	for _, m := range matches {
-		if strings.HasSuffix(m, ".m4a") || strings.HasSuffix(m, ".mp3") || strings.HasSuffix(m, ".webm") {
+		if strings.HasSuffix(m, ".m4a") || strings.HasSuffix(m, ".mp3") || strings.HasSuffix(m, ".webm") || strings.HasSuffix(m, ".opus") {
 			foundFile = m
 			break
 		}
 	}
 
 	if foundFile == "" {
-		log.Printf("[YT Stream Error] No valid audio file found on disk for %s", ytID)
+		log.Printf("[YT Stream Error] No valid audio file found for %s", ytID)
 		http.Error(w, "Audio file extraction failed", 500)
 		return
 	}
@@ -1820,10 +1854,8 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Format(time.RFC3339)
 	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
 	chatID := strings.TrimSpace(os.Getenv("CHANNEL_ID"))
-	fileID := ""
-	fp := ""
 
-	// Background Telegram sync
+	// Background Telegram upload
 	if token != "" && chatID != "" {
 		go func(tPath, sTitle, sID string) {
 			if f, err := os.Open(tPath); err == nil {
@@ -1838,7 +1870,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 
 				req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendAudio", token), body)
 				req.Header.Set("Content-Type", writer.FormDataContentType())
-				client := &http.Client{Timeout: 60 * time.Second}
+				client := &http.Client{Timeout: 90 * time.Second}
 				if resp, err := client.Do(req); err == nil {
 					defer resp.Body.Close()
 					var res struct {
@@ -1877,12 +1909,18 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	existing := appDB.Songs[ytID]
 	s := Song{
-		YTID: ytID, Title: title, Artist: artist,
-		FileID: fileID, FilePath: fp,
-		AddedAt: existing.AddedAt, PlayCount: existing.PlayCount + 1,
-		LastPlayed: now, Starred: existing.Starred, Rating: existing.Rating,
-		Duration: exactDur,
-		CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", ytID),
+		YTID:       ytID,
+		Title:      title,
+		Artist:     artist,
+		FileID:     existing.FileID,
+		FilePath:   existing.FilePath,
+		AddedAt:    existing.AddedAt,
+		PlayCount:  existing.PlayCount + 1,
+		LastPlayed: now,
+		Starred:    existing.Starred,
+		Rating:     existing.Rating,
+		Duration:   exactDur,
+		CoverArt:   fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", ytID),
 	}
 	if s.AddedAt == "" {
 		s.AddedAt = now
@@ -1891,7 +1929,6 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 	saveDB()
 
-	// Deliver audio stream with Range support
 	w.Header().Set("Content-Type", "audio/mp4")
 	http.ServeFile(w, r, targetFile)
 }
@@ -1915,7 +1952,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		"--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s",
 		"--no-download",
 		"--playlist-end", fmt.Sprintf("%d", maxVideos),
-		"--extractor-args", "youtube:player_client=mweb,web,android",
+		"--extractor-args", "youtube:player_client=android,web,mweb,ios",
 		playlistURL,
 	)
 
@@ -2611,7 +2648,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	hasAPIKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")) != ""
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v27-smartstream | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
+	fmt.Fprintf(w, "OK v28-smartstream | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
