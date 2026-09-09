@@ -1,27 +1,19 @@
-# Stage 1: Build Go binary
-FROM golang:1.22-bookworm AS builder
+FROM golang:1.22-alpine AS builder
 WORKDIR /app
-COPY main.go ./
-RUN GO111MODULE=off CGO_ENABLED=0 go build -ldflags="-s -w" -o server main.go
+COPY go.mod ./
+RUN go mod tidy
+COPY . ./
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server .
 
-# Stage 2: Minimal runtime
-FROM debian:bookworm-slim
-
-# Install only necessary packages (no Python)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Standalone yt-dlp binary (no system Python required)
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp
-
+FROM alpine:latest
+RUN apk add --no-cache python3 py3-pip ffmpeg ca-certificates curl && \
+    pip3 install --no-cache-dir yt-dlp --break-system-packages && \
+    yt-dlp --version
 WORKDIR /app
-COPY --from=builder /app/server /app/server
-
+COPY --from=builder /app/server .
+RUN mkdir -p /tmp /app/data
 ENV PORT=8000
+ENV JIOSAAVN_API_URL=https://jiosaavn-api-three-ashy.vercel.app
+ENV DB_PATH=/app/data/db.json
 EXPOSE 8000
-
 CMD ["./server"]

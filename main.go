@@ -2,2738 +2,968 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"crypto/des"
 	"crypto/md5"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
-	"html"
 	"io"
 	"log"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// -------------------- Models --------------------
+type Config struct {
+	Port           string
+	JioApiUrl      string
+	YtApiKey       string
+	YtCookies      string
+	TelegramToken  string
+	TelegramChatID string
+	TelegramFileID string
+	TelegramMusicChatID string // optional separate chat for music cache, defaults to same as DB chat
+	SubUser        string
+	SubPass        string
+	SubUsersRaw    string
+	DbPath         string
+}
+func env(k, d string) string { if v := os.Getenv(k); v != "" { return v }; return d }
+func loadConfig() Config {
+	c := Config{
+		Port:           env("PORT", "8000"),
+		JioApiUrl:      env("JIOSAAVN_API_URL", "https://jiosaavn-api-three-ashy.vercel.app"),
+		YtApiKey:       os.Getenv("YT_API_KEY"),
+		YtCookies:      os.Getenv("YT_COOKIES"),
+		TelegramToken:  os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramChatID: os.Getenv("TELEGRAM_CHAT_ID"),
+		TelegramFileID: os.Getenv("TELEGRAM_DB_FILE_ID"),
+		TelegramMusicChatID: env("TELEGRAM_MUSIC_CHAT_ID", ""),
+		SubUser:        env("SUBSONIC_USER", "admin"),
+		SubPass:        env("SUBSONIC_PASSWORD", "admin"),
+		SubUsersRaw:    os.Getenv("SUBSONIC_USERS"),
+		DbPath:         env("DB_PATH", "db.json"),
+	}
+	c.JioApiUrl = strings.TrimSuffix(c.JioApiUrl, "/")
+	if c.TelegramMusicChatID == "" { c.TelegramMusicChatID = c.TelegramChatID }
+	return c
+}
+var cfg Config
+var usersMap = map[string]string{}
+var muUsers sync.RWMutex
+func initUsers() {
+	muUsers.Lock()
+	defer muUsers.Unlock()
+	usersMap = map[string]string{}
+	usersMap[cfg.SubUser] = cfg.SubPass
+	if cfg.SubUsersRaw != "" {
+		for _, p := range strings.Split(cfg.SubUsersRaw, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" { continue }
+			kv := strings.SplitN(p, ":", 2)
+			if len(kv)==2 { usersMap[strings.TrimSpace(kv[0])]=strings.TrimSpace(kv[1]) }
+		}
+	}
+	if db.Users != nil {
+		for u,pw := range db.Users { if _,ok:=usersMap[u]; !ok { usersMap[u]=pw } }
+	}
+	log.Printf("Users loaded %d", len(usersMap))
+}
 
 type Song struct {
-	YTID       string `json:"yt_id"`
-	Title      string `json:"title"`
-	Artist     string `json:"artist"`
-	FileID     string `json:"file_id"`
-	FilePath   string `json:"file_path"`
-	AddedAt    string `json:"added_at"`
-	PlayCount  int    `json:"play_count"`
-	LastPlayed string `json:"last_played"`
-	Starred    bool   `json:"starred"`
-	Rating     int    `json:"rating"`
-	Duration   int    `json:"duration"`
-	CoverArt   string `json:"cover_art,omitempty"`
-	Lyrics     string `json:"lyrics,omitempty"`
+	ID string `json:"id"`; Title string `json:"title"`; Artist string `json:"artist"`; ArtistID string `json:"artistId"`; Album string `json:"album"`; AlbumID string `json:"albumId"`; Duration int `json:"duration"`; CoverArt string `json:"coverArt"`; Year int `json:"year"`; Genre string `json:"genre"`; Source string `json:"source"`; SourceID string `json:"sourceId"`; StreamURL string `json:"streamUrl,omitempty"`; ThumbURL string `json:"thumbUrl"`; PlayCount int `json:"playCount"`; TgFileID string `json:"tgFileId,omitempty"`; TgFileUniqueID string `json:"tgFileUniqueId,omitempty"`; CachedAt string `json:"cachedAt,omitempty"`
+}
+type Artist struct{ ID string `json:"id"`; Name string `json:"name"` }
+type Album struct{ ID string `json:"id"`; Name string `json:"name"`; Artist string `json:"artist"`; ArtistID string `json:"artistId"`; CoverArt string `json:"coverArt"`; SongIDs []string `json:"songIds"`; ThumbURL string `json:"thumbUrl"`; Year int `json:"year"` }
+type Playlist struct{ ID string `json:"id"`; Name string `json:"name"`; Owner string `json:"owner"`; Comment string `json:"comment"`; SongIDs []string `json:"songIds"`; Public bool `json:"public"`; Created string `json:"created"`; Source string `json:"source"`; SourceURL string `json:"sourceUrl"` }
+type DB struct {
+	sync.RWMutex
+	Songs map[string]*Song `json:"songs"`; Artists map[string]*Artist `json:"artists"`; Albums map[string]*Album `json:"albums"`; Playlists map[string]*Playlist `json:"playlists"`; Users map[string]string `json:"users"`; Starred map[string]map[string]bool `json:"starred"`
+}
+var db = &DB{Songs: make(map[string]*Song), Artists: make(map[string]*Artist), Albums: make(map[string]*Album), Playlists: make(map[string]*Playlist), Users: make(map[string]string), Starred: make(map[string]map[string]bool)}
+var streamCache sync.Map
+type cachedURL struct{ URL string; Expiry time.Time }
+var ytSem = make(chan struct{}, 2)
+var tgCacheInProgress sync.Map // songID -> bool to avoid duplicate uploads
+var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+func (d *DB) save() error {
+	d.RLock(); defer d.RUnlock()
+	b,_:=json.MarshalIndent(d,"","  ")
+	tmp:=cfg.DbPath+".tmp"
+	os.WriteFile(tmp,b,0644)
+	return os.Rename(tmp,cfg.DbPath)
+}
+func (d *DB) load() error {
+	if _,err:=os.Stat(cfg.DbPath); err!=nil { return err }
+	b,_:=os.ReadFile(cfg.DbPath)
+	var tmp DB
+	json.Unmarshal(b,&tmp)
+	d.Lock()
+	if tmp.Songs!=nil { d.Songs=tmp.Songs }
+	if tmp.Artists!=nil { d.Artists=tmp.Artists }
+	if tmp.Albums!=nil { d.Albums=tmp.Albums }
+	if tmp.Playlists!=nil { d.Playlists=tmp.Playlists }
+	if tmp.Users!=nil { d.Users=tmp.Users }
+	if tmp.Starred!=nil { d.Starred=tmp.Starred }
+	if d.Starred==nil { d.Starred=make(map[string]map[string]bool) }
+	d.Unlock()
+	return nil
 }
 
-type Playlist struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	SongIDs []string `json:"song_ids"`
-	Created string   `json:"created"`
-	Changed string   `json:"changed"`
-	Owner   string   `json:"owner"`
-	Comment string   `json:"comment"`
-	Public  bool     `json:"public"`
-	YTURL   string   `json:"yt_url,omitempty"`
+// Telegram DB backup
+func telegramUploadDB(){
+	if cfg.TelegramToken==""||cfg.TelegramChatID=="" { return }
+	if _,err:=os.Stat(cfg.DbPath); err!=nil { return }
+	f,_:=os.Open(cfg.DbPath)
+	defer f.Close()
+	body:=&bytes.Buffer{}
+	w:=multipart.NewWriter(body)
+	w.WriteField("chat_id",cfg.TelegramChatID)
+	w.WriteField("caption",fmt.Sprintf("backup %s songs:%d pls:%d users:%d cached:%d", time.Now().Format(time.RFC3339), len(db.Songs), len(db.Playlists), len(db.Users), countCached()))
+	part,_:=w.CreateFormFile("document","db.json")
+	io.Copy(part,f)
+	w.Close()
+	url:=fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument",cfg.TelegramToken)
+	req,_:=http.NewRequest("POST",url,body)
+	req.Header.Set("Content-Type",w.FormDataContentType())
+	client:=&http.Client{Timeout:30*time.Second}
+	resp,_:=client.Do(req)
+	if resp!=nil { defer resp.Body.Close(); b,_:=io.ReadAll(resp.Body); if len(b)>400 { b=b[:400] }; log.Println("tg db upload",string(b)) }
 }
-
-type User struct {
-	Username   string            `json:"username"`
-	Password   string            `json:"password"`
-	Starred    map[string]bool   `json:"starred"`
-	PlayCount  map[string]int    `json:"play_count"`
-	LastPlayed map[string]string `json:"last_played"`
-}
-
-type AppDB struct {
-	Songs     map[string]Song     `json:"songs"`
-	Playlists map[string]Playlist `json:"playlists"`
-	Users     map[string]User     `json:"users"`
-}
-
-type cacheEntry struct {
-	songs     []Song
-	expiresAt time.Time
-}
-
-var (
-	appDB = AppDB{
-		Songs:     make(map[string]Song),
-		Playlists: make(map[string]Playlist),
-		Users:     make(map[string]User),
-	}
-	mu              sync.RWMutex
-	backupLock      sync.Mutex
-	cookieOnce      sync.Once
-	hasCookies      bool
-	latestFileID    string
-	latestMessageID int
-	searchCache     sync.Map
-	sem             = make(chan struct{}, 2)
-	lastBackup      time.Time
-)
-
-const dbPath = "/tmp/db.json"
-const cookiePath = "/tmp/cookies.txt"
-
-// -------------------- Helpers: Audio & Duration --------------------
-
-func parseISO8601Duration(iso string) int {
-	iso = strings.TrimPrefix(iso, "PT")
-	var hours, minutes, seconds int
-	var curr int
-	for _, ch := range iso {
-		if ch >= '0' && ch <= '9' {
-			curr = curr*10 + int(ch-'0')
-		} else if ch == 'H' {
-			hours = curr
-			curr = 0
-		} else if ch == 'M' {
-			minutes = curr
-			curr = 0
-		} else if ch == 'S' {
-			seconds = curr
-			curr = 0
-		}
-	}
-	res := hours*3600 + minutes*60 + seconds
-	if res <= 0 {
-		return 180
-	}
-	return res
-}
-
-func getAudioDuration(file string) int {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "ffprobe", "-i", file, "-show_entries", "format=duration", "-v", "quiet", "-of", "csv=p=0")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		if f, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64); err == nil && f > 0 {
-			return int(f)
-		}
-	}
-	return 0
-}
-
-// -------------------- Database Parser & Telegram Persistence --------------------
-
-func parseDBData(data []byte) (AppDB, bool) {
-	var newDB AppDB
-	if err := json.Unmarshal(data, &newDB); err == nil && len(newDB.Songs) > 0 {
-		if newDB.Playlists == nil {
-			newDB.Playlists = make(map[string]Playlist)
-		}
-		if newDB.Users == nil {
-			newDB.Users = make(map[string]User)
-		}
-		return newDB, true
-	}
-
-	var oldMap map[string]Song
-	if err := json.Unmarshal(data, &oldMap); err == nil && len(oldMap) > 0 {
-		return AppDB{
-			Songs:     oldMap,
-			Playlists: make(map[string]Playlist),
-			Users:     make(map[string]User),
-		}, true
-	}
-
-	if newDB.Songs != nil {
-		if newDB.Playlists == nil {
-			newDB.Playlists = make(map[string]Playlist)
-		}
-		if newDB.Users == nil {
-			newDB.Users = make(map[string]User)
-		}
-		return newDB, true
-	}
-
-	return AppDB{}, false
-}
-
-func loadDB() {
-	mu.Lock()
-	defer mu.Unlock()
-
-	loaded := false
-
-	if data, err := os.ReadFile(dbPath); err == nil {
-		if parsed, ok := parseDBData(data); ok && len(parsed.Songs) > 0 {
-			appDB = parsed
-			loaded = true
-			log.Printf("[DB] Loaded local cache: %d songs, %d playlists, %d users", len(appDB.Songs), len(appDB.Playlists), len(appDB.Users))
-		}
-	}
-
-	if !loaded || len(appDB.Songs) == 0 {
-		fileID := strings.TrimSpace(os.Getenv("DB_JSON_FILE_ID"))
-		if fileID != "" {
-			log.Printf("[DB] Fetching database from Telegram FileID: %s...", fileID)
-			data, err := downloadDBFromTelegram(fileID)
-			if err == nil {
-				if parsed, ok := parseDBData(data); ok && len(parsed.Songs) > 0 {
-					appDB = parsed
-					latestFileID = fileID
-					os.WriteFile(dbPath, data, 0644)
-					log.Printf("[DB] Successfully restored from Telegram: %d songs, %d playlists, %d users", len(appDB.Songs), len(appDB.Playlists), len(appDB.Users))
-					ensureAdminUser()
-					return
-				}
-			} else {
-				log.Printf("[DB] Telegram download error: %v", err)
-			}
-		}
-	}
-
-	if len(appDB.Songs) == 0 {
-		appDB = AppDB{
-			Songs:     make(map[string]Song),
-			Playlists: make(map[string]Playlist),
-			Users:     make(map[string]User),
-		}
-		log.Println("[DB] Initialized fresh empty DB")
-	}
-
-	ensureAdminUser()
-}
-
-func ensureAdminUser() {
-	adminU, adminP := getAdminCreds()
-	if _, ok := appDB.Users[adminU]; !ok {
-		appDB.Users[adminU] = User{
-			Username:   adminU,
-			Password:   adminP,
-			Starred:    make(map[string]bool),
-			PlayCount:  make(map[string]int),
-			LastPlayed: make(map[string]string),
-		}
-	}
-}
-
-func saveDB() {
-	mu.RLock()
-	data, err := json.MarshalIndent(appDB, "", "  ")
-	mu.RUnlock()
-	if err != nil {
-		return
-	}
-	os.WriteFile(dbPath, data, 0644)
-	go backupDBToTelegram()
-}
-
-func backupDBToTelegram() {
-	if !backupLock.TryLock() {
-		return
-	}
-	defer backupLock.Unlock()
-
-	if time.Since(lastBackup) < 45*time.Second {
-		return
-	}
-	lastBackup = time.Now()
-
-	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
-	chatID := strings.TrimSpace(os.Getenv("CHANNEL_ID"))
-	if token == "" || chatID == "" {
-		return
-	}
-
-	// Delete previous backup message
-	if latestMessageID > 0 {
-		deleteURL := fmt.Sprintf("https://api.telegram.org/bot%s/deleteMessage?chat_id=%s&message_id=%d", token, chatID, latestMessageID)
-		client := &http.Client{Timeout: 10 * time.Second}
-		if resp, err := client.Get(deleteURL); err == nil {
-			resp.Body.Close()
-			log.Printf("[Telegram Backup] Old message deleted: %d", latestMessageID)
-		}
-		latestMessageID = 0
-	}
-
-	mu.RLock()
-	songCnt := len(appDB.Songs)
-	plCnt := len(appDB.Playlists)
-	userCnt := len(appDB.Users)
-	mu.RUnlock()
-
-	file, err := os.Open(dbPath)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("document", "db.json")
-	if err != nil {
-		return
-	}
-	io.Copy(part, file)
-	writer.WriteField("chat_id", chatID)
-	writer.WriteField("caption", fmt.Sprintf("DB Backup %s | Songs: %d | Playlists: %d | Users: %d", time.Now().Format("2006-01-02 15:04:05"), songCnt, plCnt, userCnt))
-	writer.Close()
-
-	req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", token), body)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
+func countCached()int{ c:=0; db.RLock(); for _,s:=range db.Songs{ if s.TgFileID!=""{ c++ } }; db.RUnlock(); return c }
+func telegramDownloadDB() error {
+	if cfg.TelegramToken==""||cfg.TelegramFileID=="" { return fmt.Errorf("no file_id") }
+	u:=fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s",cfg.TelegramToken,cfg.TelegramFileID)
+	resp,err:=httpClient.Get(u)
+	if err!=nil { return err }
 	defer resp.Body.Close()
+	var r struct{ Ok bool; Result struct{ FilePath string `json:"file_path"` } `json:"result"` }
+	json.NewDecoder(resp.Body).Decode(&r)
+	if r.Result.FilePath=="" { return fmt.Errorf("empty path") }
+	down:=fmt.Sprintf("https://api.telegram.org/file/bot%s/%s",cfg.TelegramToken,r.Result.FilePath)
+	resp2,_:=httpClient.Get(down)
+	defer resp2.Body.Close()
+	b,_:=io.ReadAll(resp2.Body)
+	return os.WriteFile(cfg.DbPath,b,0644)
+}
 
-	var res struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			MessageID int `json:"message_id"`
-			Document  struct {
-				FileID string `json:"file_id"`
-			} `json:"document"`
+// Telegram music cache functions
+func telegramGetFileUrl(fileID string)(string,error){
+	if cfg.TelegramToken=="" { return "",fmt.Errorf("no token") }
+	u:=fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s",cfg.TelegramToken,fileID)
+	resp,err:=httpClient.Get(u)
+	if err!=nil { return "",err }
+	defer resp.Body.Close()
+	var r struct{ Ok bool; Result struct{ FilePath string `json:"file_path"` } `json:"result"` }
+	if err:=json.NewDecoder(resp.Body).Decode(&r); err!=nil { return "",err }
+	if r.Result.FilePath=="" { return "",fmt.Errorf("empty file_path") }
+	return fmt.Sprintf("https://api.telegram.org/file/bot%s/%s",cfg.TelegramToken,r.Result.FilePath),nil
+}
+func telegramUploadAudioFile(filePathOrUrl string, song *Song)(string,string,error){
+	// filePathOrUrl can be http url (yt direct) or local path
+	// we will download to memory if url, max 50MB
+	if cfg.TelegramToken==""||cfg.TelegramMusicChatID=="" { return "","",fmt.Errorf("tg not configured") }
+	var reader io.Reader
+	var filename string
+	filename = fmt.Sprintf("%s - %s.m4a", song.Artist, song.Title)
+	filename = strings.ReplaceAll(filename, "/", "_")
+	filename = strings.ReplaceAll(filename, "\"", "")
+
+	var data []byte
+	if strings.HasPrefix(filePathOrUrl,"http"){
+		resp,err:=httpClient.Get(filePathOrUrl)
+		if err!=nil { return "","",err }
+		defer resp.Body.Close()
+		// limit 48MB
+		limited:=io.LimitReader(resp.Body, 48*1024*1024)
+		data, _ = io.ReadAll(limited)
+		reader = bytes.NewReader(data)
+	} else {
+		f,err:=os.Open(filePathOrUrl)
+		if err!=nil { return "","",err }
+		defer f.Close()
+		data,_=io.ReadAll(io.LimitReader(f, 48*1024*1024))
+		reader = bytes.NewReader(data)
+	}
+
+	body:=&bytes.Buffer{}
+	w:=multipart.NewWriter(body)
+	w.WriteField("chat_id",cfg.TelegramMusicChatID)
+	w.WriteField("caption",fmt.Sprintf("🎵 %s - %s | %s | %s", song.Artist, song.Title, song.ID, time.Now().Format("2006-01-02")))
+	// Telegram prefers audio or document - use audio for better player
+	part,_:=w.CreateFormFile("audio", filename)
+	io.Copy(part, reader)
+	w.Close()
+
+	apiUrl:=fmt.Sprintf("https://api.telegram.org/bot%s/sendAudio",cfg.TelegramToken)
+	req,_:=http.NewRequest("POST",apiUrl,body)
+	req.Header.Set("Content-Type",w.FormDataContentType())
+	client:=&http.Client{Timeout: 60*time.Second}
+	resp,err:=client.Do(req)
+	if err!=nil { return "","",err }
+	defer resp.Body.Close()
+	b,_:=io.ReadAll(resp.Body)
+	// parse response
+	var res struct{
+		Ok bool `json:"ok"`
+		Result struct{
+			Audio struct{ FileID string `json:"file_id"`; FileUniqueID string `json:"file_unique_id"` } `json:"audio"`
+			Document struct{ FileID string `json:"file_id"`; FileUniqueID string `json:"file_unique_id"` } `json:"document"`
 		} `json:"result"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&res) == nil && res.Ok {
-		latestFileID = res.Result.Document.FileID
-		latestMessageID = res.Result.MessageID
-		log.Printf("[Telegram Backup] Synced! FileID: %s | MessageID: %d", latestFileID, latestMessageID)
-	}
-}
-
-func downloadDBFromTelegram(fileID string) ([]byte, error) {
-	fileID = strings.TrimSpace(fileID)
-	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
-	if token == "" || fileID == "" {
-		return nil, fmt.Errorf("credentials missing")
-	}
-
-	client := &http.Client{Timeout: 25 * time.Second}
-	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", token, fileID)
-	resp, err := client.Get(apiURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBytes, _ := io.ReadAll(resp.Body)
-	var gf struct {
-		Ok          bool   `json:"ok"`
 		Description string `json:"description"`
-		Result      struct {
-			FilePath string `json:"file_path"`
-		} `json:"result"`
 	}
-	if err := json.Unmarshal(respBytes, &gf); err != nil || !gf.Ok {
-		return nil, fmt.Errorf("getFile error: %s", gf.Description)
+	json.Unmarshal(b,&res)
+	if !res.Ok{
+		// try as document if audio fails (sometimes m4a not recognized)
+		// retry as document
+		body2:=&bytes.Buffer{}
+		w2:=multipart.NewWriter(body2)
+		w2.WriteField("chat_id",cfg.TelegramMusicChatID)
+		w2.WriteField("caption",fmt.Sprintf("🎵 %s - %s | %s", song.Artist, song.Title, song.ID))
+		part2,_:=w2.CreateFormFile("document", filename)
+		part2.Write(data)
+		w2.Close()
+		apiUrl2:=fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument",cfg.TelegramToken)
+		req2,_:=http.NewRequest("POST",apiUrl2,body2)
+		req2.Header.Set("Content-Type",w2.FormDataContentType())
+		resp2,err2:=client.Do(req2)
+		if err2!=nil { return "","",fmt.Errorf("audio fail: %s doc err: %v", res.Description, err2) }
+		defer resp2.Body.Close()
+		b2,_:=io.ReadAll(resp2.Body)
+		var res2 struct{ Ok bool; Result struct{ Document struct{ FileID string `json:"file_id"`; FileUniqueID string `json:"file_unique_id"` } `json:"document"` } `json:"result"`; Description string `json:"description"` }
+		json.Unmarshal(b2,&res2)
+		if !res2.Ok{ return "","",fmt.Errorf("tg upload failed audio:%s doc:%s", res.Description, res2.Description) }
+		return res2.Result.Document.FileID, res2.Result.Document.FileUniqueID, nil
 	}
+	fid:=res.Result.Audio.FileID
+	if fid==""{ fid=res.Result.Document.FileID }
+	fuid:=res.Result.Audio.FileUniqueID
+	if fuid==""{ fuid=res.Result.Document.FileUniqueID }
+	if fid==""{ return "","",fmt.Errorf("no file_id in response %s", string(b)) }
+	return fid,fuid,nil
+}
+func cacheSongToTelegram(s *Song, streamUrl string){
+	if s.TgFileID!="" { return }
+	if _,inProg:=tgCacheInProgress.Load(s.ID); inProg { return }
+	tgCacheInProgress.Store(s.ID,true)
+	defer tgCacheInProgress.Delete(s.ID)
 
-	fileURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, gf.Result.FilePath)
-	r2, err := client.Get(fileURL)
-	if err != nil {
-		return nil, err
+	log.Printf("Caching to TG: %s - %s (%s)", s.Artist, s.Title, s.ID)
+	fid,fuid,err:=telegramUploadAudioFile(streamUrl, s)
+	if err!=nil{
+		log.Printf("TG cache failed for %s: %v", s.ID, err)
+		return
 	}
-	defer r2.Body.Close()
-
-	return io.ReadAll(r2.Body)
+	db.Lock()
+	if song,ok:=db.Songs[s.ID]; ok{
+		song.TgFileID=fid
+		song.TgFileUniqueID=fuid
+		song.CachedAt=time.Now().Format(time.RFC3339)
+	}
+	db.Unlock()
+	db.save()
+	go telegramUploadDB()
+	log.Printf("Cached %s to TG file_id %s", s.ID, fid[:20])
 }
 
-func getTelegramFilePath(fileID string) string {
-	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
-	fileID = strings.TrimSpace(fileID)
-	if token == "" || fileID == "" {
-		return ""
+func checkAuth(r *http.Request)(bool,string){
+	q:=r.URL.Query()
+	u:=q.Get("u"); if u=="" { u=q.Get("username") }
+	p:=q.Get("p"); t:=q.Get("t"); s:=q.Get("s")
+	if u==""{
+		if strings.Contains(r.URL.Path,"ping") { return true,cfg.SubUser }
+		muUsers.RLock()
+		if len(usersMap)==1 { for user:=range usersMap { muUsers.RUnlock(); return true,user } }
+		muUsers.RUnlock()
+		return false,""
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", token, fileID))
-	if err != nil {
-		return ""
+	muUsers.RLock(); exp,ok:=usersMap[u]; muUsers.RUnlock()
+	if !ok { return false,"" }
+	if t!=""&&s!=""{
+		h:=md5.New(); h.Write([]byte(exp+s))
+		if fmt.Sprintf("%x",h.Sum(nil))==t { return true,u }
+		return false,""
 	}
-	defer resp.Body.Close()
+	if p!=""{
+		if strings.HasPrefix(p,"enc:"){ if d,err:=hex.DecodeString(p[4:]); err==nil { p=string(d) } }
+		if p==exp { return true,u }
+	}
+	return false,""
+}
+func writeJSON(w http.ResponseWriter,s int,p interface{}){ w.Header().Set("Content-Type","application/json"); w.WriteHeader(s); json.NewEncoder(w).Encode(p) }
+func subOK(d map[string]interface{})map[string]interface{}{
+	b:=map[string]interface{}{"status":"ok","version":"1.16.1","type":"go-jio-yt-tgcache","serverVersion":"3.0-tg-cache","openSubsonic":true}
+	for k,v:=range d{ b[k]=v }
+	return map[string]interface{}{"subsonic-response":b}
+}
+func subFail(m string,c int)map[string]interface{}{
+	return map[string]interface{}{"subsonic-response":map[string]interface{}{"status":"failed","version":"1.16.1","error":map[string]interface{}{"code":c,"message":m}}}
+}
+func respond(w http.ResponseWriter,r *http.Request,d map[string]interface{}){ writeJSON(w,200,subOK(d)) }
 
-	var res struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			FilePath string `json:"file_path"`
-		} `json:"result"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&res) == nil && res.Ok {
-		return res.Result.FilePath
+func slugArtist(n string)string{ return "ar_"+url.PathEscape(strings.ToLower(strings.ReplaceAll(strings.TrimSpace(n)," ","_"))) }
+func slugAlbum(n,a string)string{ return "al_"+url.PathEscape(strings.ToLower(strings.ReplaceAll(a+"_"+n," ","_"))) }
+func ensureArtist(n string)*Artist{
+	if n==""{ n="Unknown Artist" }
+	id:=slugArtist(n)
+	db.RLock(); if a,ok:=db.Artists[id]; ok{ db.RUnlock(); return a }; db.RUnlock()
+	a:=&Artist{ID:id,Name:n}
+	db.Lock(); db.Artists[id]=a; db.Unlock()
+	return a
+}
+func ensureAlbum(name,artist,artistId,thumb string)*Album{
+	if name==""{ name="Unknown Album" }
+	id:=slugAlbum(name,artist)
+	db.RLock(); if al,ok:=db.Albums[id]; ok{ db.RUnlock(); return al }; db.RUnlock()
+	al:=&Album{ID:id,Name:name,Artist:artist,ArtistID:artistId,CoverArt:id,ThumbURL:thumb,SongIDs:[]string{}}
+	db.Lock(); db.Albums[id]=al; db.Unlock()
+	return al
+}
+func contains(arr []string,s string)bool{ for _,v:=range arr{ if v==s{ return true } }; return false }
+
+func parseJioImage(img interface{})string{
+	switch v:=img.(type){
+	case string: return v
+	case []interface{}:
+		if len(v)>0{ if m,ok:=v[len(v)-1].(map[string]interface{}); ok{ if u,ok:=m["url"].(string); ok{ return u } } }
 	}
 	return ""
 }
-
-// -------------------- Secure Audio Proxy --------------------
-
-func proxyTelegramAudio(w http.ResponseWriter, r *http.Request, token, fp string) {
-	audioURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, fp)
-	req, err := http.NewRequestWithContext(r.Context(), "GET", audioURL, nil)
-	if err != nil {
-		http.Error(w, "Proxy request error", 500)
-		return
+func parseJioDownloadUrl(d interface{})string{
+	if s,ok:=d.(string); ok{ return s }
+	if arr,ok:=d.([]interface{}); ok{
+		var best string
+		for _,it:=range arr{
+			if m,ok:=it.(map[string]interface{}); ok{
+				link,_:=m["link"].(string)
+				if link==""{ link,_=m["url"].(string) }
+				if q,_:=m["quality"].(string); strings.Contains(q,"320"){ return link }
+				best=link
+			}
+		}
+		return best
 	}
-
-	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
-		req.Header.Set("Range", rangeHdr)
-	}
-
-	client := &http.Client{Timeout: 2 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		http.Error(w, "Storage unreachable", 502)
-		return
-	}
+	return ""
+}
+func searchJio(query string)([]*Song,error){
+	if query==""{ return nil,nil }
+	ep:=fmt.Sprintf("%s/search?query=%s",cfg.JioApiUrl,url.QueryEscape(query))
+	resp,err:=httpClient.Get(ep)
+	if err!=nil{ return nil,err }
 	defer resp.Body.Close()
-
-	for _, h := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
-		if val := resp.Header.Get(h); val != "" {
-			w.Header().Set(h, val)
-		}
+	body,_:=io.ReadAll(resp.Body)
+	var g map[string]interface{}
+	json.Unmarshal(body,&g)
+	var raw []interface{}
+	if data,ok:=g["data"].(map[string]interface{}); ok{
+		if res,ok:=data["results"].([]interface{}); ok{ raw=res }
 	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-}
-
-// -------------------- Helpers & Cleaner --------------------
-
-func initCookies() {
-	cookieOnce.Do(func() {
-		if b64 := strings.TrimSpace(os.Getenv("YT_COOKIES_B64")); len(b64) > 50 {
-			b64 = strings.ReplaceAll(b64, "\n", "")
-			b64 = strings.ReplaceAll(b64, "\r", "")
-			b64 = strings.ReplaceAll(b64, " ", "")
-			decoded, err := base64.StdEncoding.DecodeString(b64)
-			if err != nil {
-				decoded, err = base64.RawStdEncoding.DecodeString(b64)
-			}
-			if err == nil && len(decoded) > 50 {
-				os.WriteFile(cookiePath, decoded, 0644)
-				hasCookies = true
-				log.Println("[Cookies] Loaded successfully from YT_COOKIES_B64")
-				return
-			}
-		}
-		if raw := os.Getenv("YT_COOKIES"); len(raw) > 50 {
-			os.WriteFile(cookiePath, []byte(raw), 0644)
-			hasCookies = true
-			log.Println("[Cookies] Loaded successfully from YT_COOKIES")
-		}
-	})
-}
-
-func getCookiesArg() []string {
-	initCookies()
-	if hasCookies {
-		return []string{"--cookies", cookiePath}
+	var songs []*Song
+	for _,rs:=range raw{
+		m,_:=rs.(map[string]interface{})
+		title,_:=m["name"].(string)
+		if title==""{ continue }
+		artist,_:=m["primaryArtists"].(string)
+		if artist==""{ artist="Various" }
+		id,_:=m["id"].(string)
+		thumb:=parseJioImage(m["image"])
+		artistObj:=ensureArtist(artist)
+		albumObj:=ensureAlbum(title+" Single",artist,artistObj.ID,thumb)
+		s:=&Song{ID:"jio_"+id,Title:title,Artist:artist,ArtistID:artistObj.ID,Album:albumObj.Name,AlbumID:albumObj.ID,CoverArt:albumObj.ID,Source:"jio",SourceID:id,ThumbURL:thumb}
+		if dl,ok:=m["downloadUrl"]; ok{ s.StreamURL=parseJioDownloadUrl(dl) }
+		songs=append(songs,s)
+		db.Lock()
+		db.Songs[s.ID]=s
+		if !contains(albumObj.SongIDs,s.ID){ albumObj.SongIDs=append(albumObj.SongIDs,s.ID) }
+		db.Unlock()
 	}
-	return []string{}
+	if len(songs)>0{ go func(){ db.save(); go telegramUploadDB() }() }
+	return songs,nil
 }
-
-func startTempCleaner() {
-	go func() {
-		ticker := time.NewTicker(10 * time.Minute)
-		for range ticker.C {
-			files, _ := filepath.Glob("/tmp/*.m4a")
-			now := time.Now()
-			for _, f := range files {
-				if info, err := os.Stat(f); err == nil {
-					if now.Sub(info.ModTime()) > 30*time.Minute {
-						os.Remove(f)
+func getJioStream(jioId string)(string,error){
+	if v,ok:=streamCache.Load("jio_"+jioId); ok{
+		c:=v.(cachedURL)
+		if time.Now().Before(c.Expiry){ return c.URL,nil }
+	}
+	ep:=fmt.Sprintf("%s/songs?id=%s",cfg.JioApiUrl,jioId)
+	resp,_:=httpClient.Get(ep)
+	if resp!=nil{
+		defer resp.Body.Close()
+		body,_:=io.ReadAll(resp.Body)
+		var g map[string]interface{}
+		json.Unmarshal(body,&g)
+		if data,ok:=g["data"].([]interface{}); ok{
+			for _,it:=range data{
+				if m,ok:=it.(map[string]interface{}); ok{
+					if dl,ok:=m["downloadUrl"]; ok{
+						u:=parseJioDownloadUrl(dl)
+						if u!=""{
+							streamCache.Store("jio_"+jioId,cachedURL{URL:u,Expiry:time.Now().Add(time.Hour)})
+							return u,nil
+						}
 					}
 				}
 			}
 		}
-	}()
+	}
+	return "",fmt.Errorf("jio not found")
 }
-
-// -------------------- Authentication --------------------
-
-func getAdminCreds() (string, string) {
-	u := strings.TrimSpace(os.Getenv("ADMIN_USER"))
-	p := os.Getenv("ADMIN_PASS")
-	if u == "" {
-		u = "admin"
-	}
-	if p == "" {
-		p = "admin"
-	}
-	return u, p
+type YTSearch struct{
+	Items []struct{
+		ID struct{ VideoID string `json:"videoId"` } `json:"id"`
+		Snippet struct{
+			Title string `json:"title"`; ChannelTitle string `json:"channelTitle"`
+			Thumbnails map[string]struct{ URL string `json:"url"` } `json:"thumbnails"`
+		} `json:"snippet"`
+	} `json:"items"`
 }
-
-func verifyPassword(actualPassword, p, t, s string) bool {
-	if p != "" {
-		if strings.HasPrefix(p, "enc:") {
-			hexPart := strings.TrimPrefix(p, "enc:")
-			decoded, err := hex.DecodeString(hexPart)
-			if err == nil && string(decoded) == actualPassword {
-				return true
-			}
-			return false
-		}
-		return p == actualPassword
-	}
-	if t != "" && s != "" {
-		hash := md5.Sum([]byte(actualPassword + s))
-		expected := hex.EncodeToString(hash[:])
-		return strings.EqualFold(t, expected)
-	}
-	return false
-}
-
-func getCurrentUser(r *http.Request) string {
-	u := strings.TrimSpace(r.URL.Query().Get("u"))
-	p := r.URL.Query().Get("p")
-	t := r.URL.Query().Get("t")
-	s := r.URL.Query().Get("s")
-	if u == "" {
-		return ""
-	}
-
-	adminUser, adminPass := getAdminCreds()
-	if u == adminUser && verifyPassword(adminPass, p, t, s) {
-		return u
-	}
-
-	mu.RLock()
-	user, exists := appDB.Users[u]
-	mu.RUnlock()
-	if exists && verifyPassword(user.Password, p, t, s) {
-		return u
-	}
-	return ""
-}
-
-func checkAuth(r *http.Request) bool {
-	return getCurrentUser(r) != ""
-}
-
-func isAdmin(r *http.Request) bool {
-	adminUser, _ := getAdminCreds()
-	return getCurrentUser(r) == adminUser
-}
-
-// -------------------- Subsonic Response Encoders --------------------
-
-func writeSubsonicError(w http.ResponseWriter, code int, msg string, f string) {
-	if f == "json" {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":%d,"message":"%s"}}}`, code, msg)
-		return
-	}
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
-<subsonic-response status="failed" version="1.16.1" xmlns="http://subsonic.org/restapi">
-  <error code="%d" message="%s"/>
-</subsonic-response>`, code, msg)
-}
-
-func writeSubsonicOK(w http.ResponseWriter, f string, body interface{}) {
-	if f == "json" {
-		w.Header().Set("Content-Type", "application/json")
-		resp := map[string]interface{}{
-			"subsonic-response": map[string]interface{}{
-				"status":  "ok",
-				"version": "1.16.1",
-			},
-		}
-		if m, ok := body.(map[string]interface{}); ok {
-			for k, v := range m {
-				resp["subsonic-response"].(map[string]interface{})[k] = v
+func searchYoutube(q string)([]*Song,error){
+	if cfg.YtApiKey==""{ return nil,fmt.Errorf("no key") }
+	u:=fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=15&q=%s&key=%s",url.QueryEscape(q),cfg.YtApiKey)
+	resp,_:=httpClient.Get(u)
+	if resp==nil{ return nil,fmt.Errorf("yt fail") }
+	defer resp.Body.Close()
+	var yt YTSearch
+	json.NewDecoder(resp.Body).Decode(&yt)
+	var songs []*Song
+	for _,it:=range yt.Items{
+		if it.ID.VideoID==""{ continue }
+		thumb:=""
+		if t,ok:=it.Snippet.Thumbnails["high"]; ok{ thumb=t.URL }
+		art:=ensureArtist(it.Snippet.ChannelTitle)
+		al:=ensureAlbum(it.Snippet.ChannelTitle+" - YouTube",it.Snippet.ChannelTitle,art.ID,thumb)
+		s:=&Song{ID:"yt_"+it.ID.VideoID,Title:it.Snippet.Title,Artist:it.Snippet.ChannelTitle,ArtistID:art.ID,Album:al.Name,AlbumID:al.ID,CoverArt:al.ID,Source:"yt",SourceID:it.ID.VideoID,ThumbURL:thumb}
+		songs=append(songs,s)
+		db.Lock()
+		if existing,ok:=db.Songs[s.ID]; ok{
+			// keep TgFileID if already cached
+			if existing.TgFileID!=""{
+				s.TgFileID=existing.TgFileID
+				s.TgFileUniqueID=existing.TgFileUniqueID
+				s.CachedAt=existing.CachedAt
 			}
 		}
-		json.NewEncoder(w).Encode(resp)
-		return
+		db.Songs[s.ID]=s
+		if !contains(al.SongIDs,s.ID){ al.SongIDs=append(al.SongIDs,s.ID) }
+		db.Unlock()
 	}
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>`)
-	fmt.Fprint(w, `<subsonic-response status="ok" version="1.16.1" xmlns="http://subsonic.org/restapi">`)
-	if s, ok := body.(string); ok {
-		fmt.Fprint(w, s)
+	go func(){ db.save(); go telegramUploadDB() }()
+	return songs,nil
+}
+func getYoutubeStream(vid string)(string,error){
+	if v,ok:=streamCache.Load("yt_"+vid); ok{
+		c:=v.(cachedURL)
+		if time.Now().Before(c.Expiry){ return c.URL,nil }
 	}
-	fmt.Fprint(w, `</subsonic-response>`)
+	ytSem<-struct{}{}
+	defer func(){ <-ytSem }()
+	cookie:=""
+	if cfg.YtCookies!=""{
+		cookie="/tmp/cookies.txt"
+		os.WriteFile(cookie,[]byte(cfg.YtCookies),0600)
+	}
+	args:=[]string{"--no-playlist","--get-url","-f","bestaudio[ext=m4a]/bestaudio","https://www.youtube.com/watch?v="+vid}
+	if cookie!=""{ args=append([]string{"--cookies",cookie},args...) }
+	cmd:=exec.Command("yt-dlp",args...)
+	var out bytes.Buffer
+	var errBuf bytes.Buffer
+	cmd.Stdout=&out
+	cmd.Stderr=&errBuf
+	done:=make(chan error,1)
+	go func(){ done<-cmd.Run() }()
+	select{
+	case err:=<-done:
+		if err!=nil{ return "",fmt.Errorf("%v %s",err,errBuf.String()) }
+	case <-time.After(20*time.Second):
+		cmd.Process.Kill()
+		return "",fmt.Errorf("timeout")
+	}
+	for _,line:=range strings.Split(strings.TrimSpace(out.String()),"\n"){
+		if strings.HasPrefix(strings.TrimSpace(line),"http"){
+			streamCache.Store("yt_"+vid,cachedURL{URL:strings.TrimSpace(line),Expiry:time.Now().Add(30*time.Minute)})
+			return strings.TrimSpace(line),nil
+		}
+	}
+	return "",fmt.Errorf("no url")
+}
+func extractPlaylistID(input string)string{
+	if strings.HasPrefix(input,"PL")&&!strings.Contains(input,"http"){ return input }
+	u,err:=url.Parse(input)
+	if err==nil{
+		if list:=u.Query().Get("list"); list!=""{ return list }
+	}
+	re:=regexp.MustCompile(`[?&]list=([a-zA-Z0-9_-]+)`)
+	m:=re.FindStringSubmatch(input)
+	if len(m)>1{ return m[1] }
+	return input
+}
+func importYoutubePlaylist(pid string,owner string)(*Playlist,error){
+	if cfg.YtApiKey==""{ return nil,fmt.Errorf("YT_API_KEY missing") }
+	pid=extractPlaylistID(pid)
+	title:=pid
+	infoURL:=fmt.Sprintf("https://www.googleapis.com/youtube/v3/playlists?part=snippet&id=%s&key=%s",pid,cfg.YtApiKey)
+	if resp,err:=httpClient.Get(infoURL); err==nil{
+		defer resp.Body.Close()
+		var pr struct{ Items []struct{ Snippet struct{ Title string `json:"title"` } `json:"snippet"` } `json:"items"` }
+		json.NewDecoder(resp.Body).Decode(&pr)
+		if len(pr.Items)>0{ title=pr.Items[0].Snippet.Title }
+	}
+	var allIDs []string
+	pageToken:=""
+	for{
+		apiUrl:=fmt.Sprintf("https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId=%s&key=%s",pid,cfg.YtApiKey)
+		if pageToken!=""{ apiUrl+="&pageToken="+pageToken }
+		resp,err:=httpClient.Get(apiUrl)
+		if err!=nil{ break }
+		var pr struct{
+			NextPageToken string `json:"nextPageToken"`
+			Items []struct{ Snippet struct{
+				ResourceID struct{ VideoID string `json:"videoId"` } `json:"resourceId"`
+				Title string `json:"title"`; ChannelTitle string `json:"channelTitle"`
+				Thumbnails map[string]struct{ URL string `json:"url"` } `json:"thumbnails"`
+			} `json:"snippet"` } `json:"items"`
+		}
+		json.NewDecoder(resp.Body).Decode(&pr)
+		resp.Body.Close()
+		for _,it:=range pr.Items{
+			if it.Snippet.ResourceID.VideoID==""{ continue }
+			vid:=it.Snippet.ResourceID.VideoID
+			allIDs=append(allIDs,vid)
+			thumb:=""
+			if t,ok:=it.Snippet.Thumbnails["high"]; ok{ thumb=t.URL }
+			art:=ensureArtist(it.Snippet.ChannelTitle)
+			al:=ensureAlbum(it.Snippet.ChannelTitle+" - YouTube",it.Snippet.ChannelTitle,art.ID,thumb)
+			sID:="yt_"+vid
+			s:=&Song{ID:sID,Title:it.Snippet.Title,Artist:it.Snippet.ChannelTitle,ArtistID:art.ID,Album:al.Name,AlbumID:al.ID,CoverArt:al.ID,Source:"yt",SourceID:vid,ThumbURL:thumb}
+			db.Lock()
+			if existing,ok:=db.Songs[s.ID]; ok && existing.TgFileID!=""{
+				s.TgFileID=existing.TgFileID
+				s.TgFileUniqueID=existing.TgFileUniqueID
+				s.CachedAt=existing.CachedAt
+			}
+			db.Songs[s.ID]=s
+			if !contains(al.SongIDs,s.ID){ al.SongIDs=append(al.SongIDs,s.ID) }
+			db.Unlock()
+		}
+		if pr.NextPageToken==""{ break }
+		pageToken=pr.NextPageToken
+		if len(allIDs)>500{ break }
+	}
+	if len(allIDs)==0{ return nil,fmt.Errorf("no videos") }
+	plID:="pl_"+pid
+	pl:=&Playlist{ID:plID,Name:title,Owner:owner,Comment:fmt.Sprintf("YT Import %d songs - %s - TG Cache enabled",len(allIDs),owner),SongIDs:[]string{},Created:time.Now().Format(time.RFC3339),Source:"yt",SourceURL:"https://www.youtube.com/playlist?list="+pid}
+	for _,vid:=range allIDs{ pl.SongIDs=append(pl.SongIDs,"yt_"+vid) }
+	db.Lock(); db.Playlists[pl.ID]=pl; db.Unlock()
+	db.save(); go telegramUploadDB()
+	return pl,nil
 }
 
-func songToMap(s Song, u *User) map[string]interface{} {
-	albumName := "YouTube"
-	if strings.HasPrefix(s.YTID, "js-") {
-		albumName = "JioSaavn"
+// handlers
+func handlePing(w http.ResponseWriter,r *http.Request){ respond(w,r,map[string]interface{}{}) }
+func handleLicense(w http.ResponseWriter,r *http.Request){ respond(w,r,map[string]interface{}{"license":map[string]interface{}{"valid":true}}) }
+func handleMusicFolders(w http.ResponseWriter,r *http.Request){ respond(w,r,map[string]interface{}{"musicFolders":map[string]interface{}{"musicFolder":[]map[string]interface{}{{"id":0,"name":"Music"},{"id":1,"name":"TG Cached"}}}}) }
+func handleGetUser(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	respond(w,r,map[string]interface{}{"user":map[string]interface{}{"username":user,"adminRole":user==cfg.SubUser,"playlistRole":true,"jukeboxRole":false,"streamRole":true,"downloadRole":true}})
+}
+func handleGetArtists(w http.ResponseWriter,r *http.Request){
+	db.RLock(); defer db.RUnlock()
+	idx:=map[string][]map[string]interface{}{}
+	for _,a:=range db.Artists{
+		letter:="#"; if len(a.Name)>0{ letter=strings.ToUpper(string(a.Name[0])) }
+		idx[letter]=append(idx[letter],map[string]interface{}{"id":a.ID,"name":a.Name})
 	}
-
-	isStarred := false
-	playCount := s.PlayCount
-	lastPlayed := s.LastPlayed
-
-	if u != nil {
-		if u.Starred != nil && u.Starred[s.YTID] {
-			isStarred = true
+	var indexes []map[string]interface{}
+	for k,v:=range idx{ indexes=append(indexes,map[string]interface{}{"name":k,"artist":v}) }
+	respond(w,r,map[string]interface{}{"artists":map[string]interface{}{"index":indexes}})
+}
+func handleGetArtist(w http.ResponseWriter,r *http.Request){
+	id:=r.URL.Query().Get("id")
+	db.RLock(); a,ok:=db.Artists[id]; if !ok{ db.RUnlock(); writeJSON(w,200,subFail("not found",70)); return }
+	var albums []map[string]interface{}
+	for _,al:=range db.Albums{ if al.ArtistID==id{ albums=append(albums,map[string]interface{}{"id":al.ID,"name":al.Name,"songCount":len(al.SongIDs),"coverArt":al.ID}) } }
+	db.RUnlock()
+	respond(w,r,map[string]interface{}{"artist":map[string]interface{}{"id":a.ID,"name":a.Name,"album":albums}})
+}
+func handleGetAlbum(w http.ResponseWriter,r *http.Request){
+	id:=r.URL.Query().Get("id")
+	db.RLock()
+	al,ok:=db.Albums[id]
+	if !ok{ if s,ok2:=db.Songs[id]; ok2{ al,ok=db.Albums[s.AlbumID] } }
+	if !ok{ db.RUnlock(); writeJSON(w,200,subFail("not found",70)); return }
+	var songs []map[string]interface{}
+	for _,sid:=range al.SongIDs{ if s,ok:=db.Songs[sid]; ok{ songs=append(songs,songToSubsonic(s,r)) } }
+	db.RUnlock()
+	respond(w,r,map[string]interface{}{"album":map[string]interface{}{"id":al.ID,"name":al.Name,"artist":al.Artist,"coverArt":al.ID,"song":songs,"songCount":len(songs)}})
+}
+func handleGetSong(w http.ResponseWriter,r *http.Request){
+	id:=r.URL.Query().Get("id")
+	db.RLock(); s,ok:=db.Songs[id]; db.RUnlock()
+	if !ok{ writeJSON(w,200,subFail("not found",70)); return }
+	respond(w,r,map[string]interface{}{"song":songToSubsonic(s,r)})
+}
+func songToSubsonic(s *Song,r *http.Request)map[string]interface{}{
+	starred:=false
+	if r!=nil{
+		if ok,user:=checkAuth(r); ok{
+			db.RLock()
+			if m,ok:=db.Starred[user]; ok{
+				if m[s.ID]{ starred=true }
+			}
+			db.RUnlock()
 		}
-		if pc, ok := u.PlayCount[s.YTID]; ok && pc > 0 {
-			playCount = pc
-		}
-		if lp, ok := u.LastPlayed[s.YTID]; ok && lp != "" {
-			lastPlayed = lp
-		}
 	}
-
-	m := map[string]interface{}{
-		"id":          s.YTID,
-		"title":       s.Title,
-		"album":       albumName,
-		"albumId":     "al-" + s.YTID,
-		"artist":      s.Artist,
-		"artistId":    "ar-" + s.YTID,
-		"coverArt":    s.YTID,
-		"duration":    s.Duration,
-		"bitRate":     320,
-		"suffix":      "m4a",
-		"contentType": "audio/mp4",
-		"isDir":       false,
-		"playCount":   playCount,
-		"created":     s.AddedAt,
-		"userRating":  s.Rating,
-	}
-
-	if isStarred {
-		if lastPlayed != "" {
-			m["starred"] = lastPlayed
-		} else {
-			m["starred"] = s.AddedAt
-		}
-	}
-	if lastPlayed != "" {
-		m["played"] = lastPlayed
-	}
-	if s.Duration <= 0 {
-		m["duration"] = 180
-	}
+	m:=map[string]interface{}{"id":s.ID,"title":s.Title,"artist":s.Artist,"album":s.Album,"albumId":s.AlbumID,"artistId":s.ArtistID,"coverArt":s.CoverArt,"duration":s.Duration,"contentType":"audio/mp4","suffix":"m4a","year":s.Year,"genre":s.Genre,"playCount":s.PlayCount}
+	if starred{ m["starred"]=time.Now().Format(time.RFC3339) }
+	if s.TgFileID!=""{ m["cached"]="tg" }
 	return m
 }
-
-func xmlEscape(s string) string {
-	var b bytes.Buffer
-	xml.EscapeText(&b, []byte(s))
-	return b.String()
+func handleSearch3(w http.ResponseWriter,r *http.Request){
+	if ok,_:=checkAuth(r); !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	q:=r.URL.Query().Get("query")
+	sCount,_:=strconv.Atoi(r.URL.Query().Get("songCount")); if sCount==0{ sCount=50 }
+	var jio,yt []*Song
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func(){ defer wg.Done(); jio,_=searchJio(q) }()
+	go func(){ defer wg.Done(); yt,_=searchYoutube(q) }()
+	wg.Wait()
+	all:=append(jio,yt...)
+	if len(all)>sCount{ all=all[:sCount] }
+	var res []map[string]interface{}
+	for _,s:=range all{ res=append(res,songToSubsonic(s,r)) }
+	respond(w,r,map[string]interface{}{"searchResult3":map[string]interface{}{"song":res}})
 }
+func handleAlbumList2(w http.ResponseWriter,r *http.Request){
+	db.RLock(); var albums []*Album; for _,al:=range db.Albums{ albums=append(albums,al) }; db.RUnlock()
+	rand.Shuffle(len(albums),func(i,j int){ albums[i],albums[j]=albums[j],albums[i] })
+	if len(albums)>20{ albums=albums[:20] }
+	var res []map[string]interface{}
+	for _,al:=range albums{ res=append(res,map[string]interface{}{"id":al.ID,"name":al.Name,"artist":al.Artist,"coverArt":al.ID,"songCount":len(al.SongIDs)}) }
+	respond(w,r,map[string]interface{}{"albumList2":map[string]interface{}{"album":res}})
+}
+func handleRandomSongs(w http.ResponseWriter,r *http.Request){
+	db.RLock(); var all []*Song; for _,s:=range db.Songs{ all=append(all,s) }; db.RUnlock()
+	rand.Shuffle(len(all),func(i,j int){ all[i],all[j]=all[j],all[i] })
+	if len(all)>20{ all=all[:20] }
+	var res []map[string]interface{}
+	for _,s:=range all{ res=append(res,songToSubsonic(s,r)) }
+	respond(w,r,map[string]interface{}{"randomSongs":map[string]interface{}{"song":res}})
+}
+func handleStream(w http.ResponseWriter,r *http.Request){
+	if ok,_:=checkAuth(r); !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	id:=r.URL.Query().Get("id")
+	db.RLock(); s,ok:=db.Songs[id]; db.RUnlock()
+	if !ok{ http.Error(w,"not found",404); return }
+	db.Lock(); if _,ok:=db.Songs[id]; ok{ db.Songs[id].PlayCount++ }; db.Unlock()
 
-// -------------------- Search Cache Helpers --------------------
-
-func getCachedSearch(query string) ([]Song, bool) {
-	if val, ok := searchCache.Load(query); ok {
-		entry := val.(cacheEntry)
-		if time.Now().Before(entry.expiresAt) {
-			return entry.songs, true
+	// 1st priority: TG cached file
+	if s.TgFileID!=""{
+		if tgUrl,err:=telegramGetFileUrl(s.TgFileID); err==nil{
+			log.Printf("Serving TG cached: %s", s.ID)
+			req,_:=http.NewRequest("GET",tgUrl,nil)
+			resp,err:=httpClient.Do(req)
+			if err==nil{
+				defer resp.Body.Close()
+				w.Header().Set("Content-Type","audio/mp4")
+				w.Header().Set("X-Cache","TG")
+				io.Copy(w,resp.Body)
+				return
+			}
 		}
-		searchCache.Delete(query)
 	}
-	return nil, false
-}
 
-func setCachedSearch(query string, songs []Song) {
-	searchCache.Store(query, cacheEntry{
-		songs:     songs,
-		expiresAt: time.Now().Add(45 * time.Minute),
-	})
-}
+	// 2nd: YT/Jio direct
+	var urlStr string; var err error
+	if s.Source=="jio"{ urlStr,_=getJioStream(s.SourceID); if urlStr==""{ urlStr=s.StreamURL } }else{ urlStr,err=getYoutubeStream(s.SourceID) }
+	if err!=nil||urlStr==""{ http.Error(w,"stream fail",502); return }
 
-// -------------------- YouTube Engine --------------------
-
-func searchYouTubeAPI(query string, maxResults int, apiKey string) []Song {
-	searchURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=%d&q=%s&key=%s",
-		maxResults, url.QueryEscape(query), apiKey)
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(searchURL)
-	if err != nil {
-		return nil
+	// Trigger TG cache in background on first play if not cached
+	if s.TgFileID=="" && s.Source=="yt"{
+		go cacheSongToTelegram(s, urlStr)
 	}
+
+	req,_:=http.NewRequest("GET",urlStr,nil); req.Header.Set("User-Agent","Mozilla/5.0")
+	resp,err:=httpClient.Do(req)
+	if err!=nil{ http.Error(w,"upstream",502); return }
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-
-	var searchRes struct {
-		Items []struct {
-			ID struct {
-				VideoID string `json:"videoId"`
-			} `json:"id"`
-			Snippet struct {
-				Title        string `json:"title"`
-				ChannelTitle string `json:"channelTitle"`
-			} `json:"snippet"`
-		} `json:"items"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&searchRes); err != nil || len(searchRes.Items) == 0 {
-		return nil
-	}
-
-	var vIDs []string
-	for _, item := range searchRes.Items {
-		if item.ID.VideoID != "" {
-			vIDs = append(vIDs, item.ID.VideoID)
-		}
-	}
-
-	durationMap := make(map[string]int)
-	if len(vIDs) > 0 {
-		detailURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=%s&key=%s",
-			strings.Join(vIDs, ","), apiKey)
-		if dResp, err := client.Get(detailURL); err == nil {
-			defer dResp.Body.Close()
-			var dRes struct {
-				Items []struct {
-					ID             string `json:"id"`
-					ContentDetails struct {
-						Duration string `json:"duration"`
-					} `json:"contentDetails"`
-				} `json:"items"`
-			}
-			if json.NewDecoder(dResp.Body).Decode(&dRes) == nil {
-				for _, it := range dRes.Items {
-					durationMap[it.ID] = parseISO8601Duration(it.ContentDetails.Duration)
-				}
-			}
-		}
-	}
-
-	var results []Song
-	now := time.Now().Format(time.RFC3339)
-	for _, item := range searchRes.Items {
-		id := item.ID.VideoID
-		if id == "" {
-			continue
-		}
-		title := html.UnescapeString(item.Snippet.Title)
-		artist := html.UnescapeString(item.Snippet.ChannelTitle)
-		if artist == "" {
-			artist = "YouTube"
-		}
-		dur := durationMap[id]
-		if dur <= 0 {
-			dur = 180
-		}
-		results = append(results, Song{
-			YTID:     id,
-			Title:    title + " [YT]",
-			Artist:   artist,
-			AddedAt:  now,
-			Duration: dur,
-			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
-		})
-	}
-	return results
+	w.Header().Set("Content-Type","audio/mp4")
+	w.Header().Set("X-Cache","MISS")
+	io.Copy(w,resp.Body)
 }
+func handleDownload(w http.ResponseWriter,r *http.Request){
+	if ok,_:=checkAuth(r); !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	id:=r.URL.Query().Get("id")
+	db.RLock(); s,ok:=db.Songs[id]; db.RUnlock()
+	if !ok{ http.Error(w,"not found",404); return }
 
-func searchYouTubeScraper(query string, maxResults int) []Song {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cookieArgs := getCookiesArg()
-	searchTerm := fmt.Sprintf("ytsearch%d:%s", maxResults, query)
-
-	args := []string{
-		"--flat-playlist",
-		"--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s",
-		"--no-download",
-		"--no-check-certificate",
-		"--no-warnings",
-		"--geo-bypass",
+	var urlStr string
+	if s.TgFileID!=""{
+		if tgUrl,err:=telegramGetFileUrl(s.TgFileID); err==nil{
+			urlStr=tgUrl
+		}
 	}
-	if len(cookieArgs) > 0 {
-		args = append(cookieArgs, args...)
+	if urlStr==""{
+		if s.Source=="jio"{ urlStr,_=getJioStream(s.SourceID); if urlStr==""{ urlStr=s.StreamURL } }else{ var err error; urlStr,err=getYoutubeStream(s.SourceID); if err!=nil||urlStr==""{ http.Error(w,"stream fail",502); return } }
 	}
-	args = append(args, searchTerm)
-
-	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil
-	}
-
-	var results []Song
-	now := time.Now().Format(time.RFC3339)
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "WARNING") || strings.HasPrefix(line, "ERROR") {
-			continue
-		}
-		parts := strings.Split(line, "|||")
-		if len(parts) < 2 {
-			continue
-		}
-		id := strings.TrimSpace(parts[0])
-		title := strings.TrimSpace(parts[1])
-		artist := "YouTube"
-		if len(parts) >= 3 && strings.TrimSpace(parts[2]) != "" {
-			artist = strings.TrimSpace(parts[2])
-		}
-		dur := 180
-		if len(parts) >= 4 {
-			if d, err := strconv.Atoi(strings.TrimSpace(parts[3])); err == nil && d > 0 {
-				dur = d
-			}
-		}
-		if id == "" || title == "" {
-			continue
-		}
-		results = append(results, Song{
-			YTID:     id,
-			Title:    title + " [YT]",
-			Artist:   artist,
-			AddedAt:  now,
-			Duration: dur,
-			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
-		})
-	}
-	return results
+	req,_:=http.NewRequest("GET",urlStr,nil); req.Header.Set("User-Agent","Mozilla/5.0")
+	resp,err:=httpClient.Do(req)
+	if err!=nil{ http.Error(w,"upstream",502); return }
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type","audio/mp4")
+	w.Header().Set("Content-Disposition",fmt.Sprintf("attachment; filename=\"%s - %s.m4a\"", s.Artist, s.Title))
+	io.Copy(w,resp.Body)
 }
-
-func searchYouTube(query string, maxResults int) []Song {
-	if maxResults <= 0 {
-		maxResults = 6
+func handleCoverArt(w http.ResponseWriter,r *http.Request){
+	id:=r.URL.Query().Get("id")
+	var thumb string
+	db.RLock()
+	if al,ok:=db.Albums[id]; ok{ thumb=al.ThumbURL }else if s,ok:=db.Songs[id]; ok{ thumb=s.ThumbURL }else{
+		for _,al:=range db.Albums{ if al.ID==id{ thumb=al.ThumbURL; break } }
+		for _,s:=range db.Songs{ if s.ID==id{ thumb=s.ThumbURL; break } }
 	}
-	if apiKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")); apiKey != "" {
-		if songs := searchYouTubeAPI(query, maxResults, apiKey); len(songs) > 0 {
-			return songs
-		}
-	}
-	return searchYouTubeScraper(query, maxResults)
+	db.RUnlock()
+	if thumb==""{ http.Redirect(w,r,"https://via.placeholder.com/500x500.png?text=No+Art",302); return }
+	resp,_:=httpClient.Get(thumb)
+	if resp==nil{ http.Redirect(w,r,thumb,302); return }
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type","image/jpeg")
+	w.Header().Set("Cache-Control","public, max-age=86400")
+	io.Copy(w,resp.Body)
 }
-
-// -------------------- Subsonic API Endpoints --------------------
-
-func subsonicHandler(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/rest/")
-	path = strings.TrimSuffix(path, ".view")
-	path = strings.ToLower(path)
-	f := r.URL.Query().Get("f")
-	if f == "" {
-		f = "xml"
+func handleGetPlaylists(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	db.RLock(); defer db.RUnlock()
+	var list []map[string]interface{}
+	for _,pl:=range db.Playlists{
+		if pl.Owner==user||pl.Public||user==cfg.SubUser{
+			cachedCount:=0
+			for _,sid:=range pl.SongIDs{ if s,ok:=db.Songs[sid]; ok && s.TgFileID!=""{ cachedCount++ } }
+			list=append(list,map[string]interface{}{"id":pl.ID,"name":pl.Name,"owner":pl.Owner,"songCount":len(pl.SongIDs),"created":pl.Created,"public":pl.Public,"comment":pl.Comment,"cachedCount":cachedCount})
+		}
 	}
-
-	if !checkAuth(r) && path != "ping" {
-		writeSubsonicError(w, 40, "Wrong username or password", f)
-		return
-	}
-
-	currentUser := getCurrentUser(r)
-	mu.RLock()
-	userObj, hasUser := appDB.Users[currentUser]
-	mu.RUnlock()
-	var currentUserPtr *User
-	if hasUser {
-		currentUserPtr = &userObj
-	}
-
-	switch path {
-	case "ping":
-		writeSubsonicOK(w, f, map[string]interface{}{})
-
-	case "getlicense":
-		writeSubsonicOK(w, f, map[string]interface{}{
-			"license": map[string]interface{}{
-				"valid":          true,
-				"email":          currentUser + "@local",
-				"licenseExpires": "2099-01-01T00:00:00",
-			},
-		})
-
-	case "getmusicfolders":
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"musicFolders": map[string]interface{}{
-					"musicFolder": []map[string]interface{}{{"id": 1, "name": "Cloud Library"}},
-				},
-			})
-		} else {
-			writeSubsonicOK(w, f, `<musicFolders><musicFolder id="1" name="Cloud Library"/></musicFolders>`)
-		}
-
-	case "getgenres":
-		genres := []map[string]interface{}{
-			{"value": "Hindi", "songCount": len(appDB.Songs), "albumCount": 1},
-			{"value": "Punjabi", "songCount": len(appDB.Songs), "albumCount": 1},
-			{"value": "Pop", "songCount": len(appDB.Songs), "albumCount": 1},
-		}
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"genres": map[string]interface{}{"genre": genres},
-			})
-		} else {
-			writeSubsonicOK(w, f, `<genres><genre value="Hindi"/><genre value="Punjabi"/></genres>`)
-		}
-
-	case "getpodcasts":
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"podcasts": map[string]interface{}{"channel": []interface{}{}},
-			})
-		} else {
-			writeSubsonicOK(w, f, `<podcasts/>`)
-		}
-
-	case "getindexes", "getartists":
-		mu.RLock()
-		artistMap := make(map[string]int)
-		for _, s := range appDB.Songs {
-			a := s.Artist
-			if a == "" {
-				a = "Music"
-			}
-			artistMap[a]++
-		}
-		mu.RUnlock()
-
-		letterMap := make(map[string][]map[string]interface{})
-		for name, cnt := range artistMap {
-			letter := strings.ToUpper(string(name[0]))
-			if letter < "A" || letter > "Z" {
-				letter = "#"
-			}
-			id := "ar-" + strings.ToLower(strings.ReplaceAll(name, " ", "-"))
-			letterMap[letter] = append(letterMap[letter], map[string]interface{}{
-				"id": id, "name": name, "albumCount": 1, "songCount": cnt, "coverArt": id,
-			})
-		}
-
-		var letters []string
-		for l := range letterMap {
-			letters = append(letters, l)
-		}
-		sort.Strings(letters)
-
-		indexes := []map[string]interface{}{}
-		for _, l := range letters {
-			indexes = append(indexes, map[string]interface{}{"name": l, "artist": letterMap[l]})
-		}
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"artists": map[string]interface{}{"index": indexes},
-				"indexes": map[string]interface{}{"index": indexes, "lastModified": time.Now().UnixMilli()},
-			})
-		} else {
-			var b strings.Builder
-			b.WriteString(fmt.Sprintf(`<indexes lastModified="%d">`, time.Now().UnixMilli()))
-			for _, l := range letters {
-				b.WriteString(fmt.Sprintf(`<index name="%s">`, l))
-				for _, a := range letterMap[l] {
-					b.WriteString(fmt.Sprintf(`<artist id="%v" name="%v"/>`, a["id"], xmlEscape(fmt.Sprint(a["name"]))))
-				}
-				b.WriteString(`</index>`)
-			}
-			b.WriteString(`</indexes>`)
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "getartist":
-		mu.RLock()
-		songCount := len(appDB.Songs)
-		mu.RUnlock()
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"artist": map[string]interface{}{
-					"id": "ar-1", "name": "Music", "albumCount": 1,
-					"album": []map[string]interface{}{{
-						"id": "al-1", "name": "Cached Songs", "artist": "Music",
-						"artistId": "ar-1", "songCount": songCount, "coverArt": "al-1",
-					}},
-				},
-			})
-		} else {
-			writeSubsonicOK(w, f, fmt.Sprintf(`<artist id="ar-1" name="Music" albumCount="1"><album id="al-1" name="Cached Songs" artist="Music" artistId="ar-1" songCount="%d"/></artist>`, songCount))
-		}
-
-	case "getalbum", "getmusicdirectory":
-		mu.RLock()
-		allSongs := make([]Song, 0, len(appDB.Songs))
-		for _, s := range appDB.Songs {
-			allSongs = append(allSongs, s)
-		}
-		mu.RUnlock()
-
-		children := make([]map[string]interface{}, 0, len(allSongs))
-		for _, s := range allSongs {
-			children = append(children, songToMap(s, currentUserPtr))
-		}
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"album": map[string]interface{}{
-					"id": "al-1", "name": "Cached Songs", "artist": "Music",
-					"artistId": "ar-1", "songCount": len(allSongs), "coverArt": "al-1", "song": children,
-				},
-				"directory": map[string]interface{}{
-					"id": "al-1", "name": "Cached Songs", "child": children,
-				},
-			})
-		} else {
-			var b strings.Builder
-			b.WriteString(fmt.Sprintf(`<album id="al-1" name="Cached Songs" artist="YouTube" artistId="ar-1" songCount="%d">`, len(allSongs)))
-			for _, s := range allSongs {
-				b.WriteString(fmt.Sprintf(`<song id="%s" title="%s" artist="%s" coverArt="%s" duration="%d" playCount="%d"/>`, s.YTID, xmlEscape(s.Title), xmlEscape(s.Artist), s.YTID, s.Duration, s.PlayCount))
-			}
-			b.WriteString(`</album>`)
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "getsong":
-		id := r.URL.Query().Get("id")
-		mu.RLock()
-		song, ok := appDB.Songs[id]
-		mu.RUnlock()
-		if !ok {
-			writeSubsonicError(w, 70, "Song not found", f)
-			return
-		}
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{"song": songToMap(song, currentUserPtr)})
-		} else {
-			writeSubsonicOK(w, f, fmt.Sprintf(`<song id="%s" title="%s" artist="%s" coverArt="%s" duration="%d" playCount="%d"/>`, song.YTID, xmlEscape(song.Title), xmlEscape(song.Artist), song.YTID, song.Duration, song.PlayCount))
-		}
-
-	case "stream", "download":
-		id := r.URL.Query().Get("id")
-		if id == "" {
-			writeSubsonicError(w, 10, "Missing id", f)
-			return
-		}
-
-		if strings.HasPrefix(id, "js-") {
-			streamURL := getJioStreamURL(id)
-			if streamURL == "" {
-				writeSubsonicError(w, 70, "JioSaavn stream not available", f)
-				return
-			}
-			http.Redirect(w, r, streamURL, 302)
-			return
-		}
-
-		newURL := *r.URL
-		q := newURL.Query()
-		q.Set("url", "https://www.youtube.com/watch?v="+id)
-		newURL.RawQuery = q.Encode()
-		r.URL = &newURL
-		playHandler(w, r)
-
-	case "getcoverart":
-		id := r.URL.Query().Get("id")
-		cleanID := strings.TrimPrefix(strings.TrimPrefix(id, "al-"), "ar-")
-
-		mu.RLock()
-		s, ok := appDB.Songs[cleanID]
-		mu.RUnlock()
-
-		if ok && s.CoverArt != "" {
-			http.Redirect(w, r, s.CoverArt, 302)
-			return
-		}
-
-		if strings.HasPrefix(cleanID, "js-") {
-			imgURL := getJioCoverArt(cleanID)
-			if imgURL != "" {
-				http.Redirect(w, r, imgURL, 302)
-				return
-			}
-		}
-
-		if len(cleanID) == 11 && !strings.HasPrefix(cleanID, "js-") {
-			http.Redirect(w, r, "https://i.ytimg.com/vi/"+cleanID+"/hqdefault.jpg", 302)
-			return
-		}
-
-		w.Header().Set("Content-Type", "image/png")
-		w.Write([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
-
-	case "search2", "search3":
-		q := strings.TrimSpace(r.URL.Query().Get("query"))
-		qLower := strings.ToLower(q)
-
-		songCount := 25
-		if sc := r.URL.Query().Get("songCount"); sc != "" {
-			if v, err := strconv.Atoi(sc); err == nil && v > 0 {
-				songCount = v
-			}
-		}
-		if songCount > 50 {
-			songCount = 50
-		}
-
-		songOffset := 0
-		if so := r.URL.Query().Get("songOffset"); so != "" {
-			if v, err := strconv.Atoi(so); err == nil && v >= 0 {
-				songOffset = v
-			}
-		}
-
-		var allMatched []Song
-		if cachedSongs, ok := getCachedSearch(qLower); ok {
-			allMatched = cachedSongs
-		} else {
-			mu.RLock()
-			for _, s := range appDB.Songs {
-				if qLower == "" || strings.Contains(strings.ToLower(s.Title), qLower) || strings.Contains(strings.ToLower(s.Artist), qLower) {
-					allMatched = append(allMatched, s)
-				}
-			}
-			mu.RUnlock()
-
-			if len(allMatched) < 30 && len(q) >= 2 {
-				seen := map[string]bool{}
-				for _, s := range allMatched {
-					seen[s.YTID] = true
-				}
-
-				var wg sync.WaitGroup
-				var jioResults []Song
-				var ytResults []Song
-
-				wg.Add(2)
-				go func() {
-					defer wg.Done()
-					jioResults = searchJioSaavn(q, 25)
-				}()
-				go func() {
-					defer wg.Done()
-					ytResults = searchYouTube(q, 6)
-				}()
-				wg.Wait()
-
-				for _, js := range jioResults {
-					if !seen[js.YTID] {
-						allMatched = append(allMatched, js)
-						seen[js.YTID] = true
-						ensureSongInMemory(js)
-					}
-				}
-				for _, ys := range ytResults {
-					if !seen[ys.YTID] {
-						allMatched = append(allMatched, ys)
-						seen[ys.YTID] = true
-						ensureSongInMemory(ys)
-					}
-				}
-			}
-			setCachedSearch(qLower, allMatched)
-		}
-
-		totalSongs := len(allMatched)
-		var pagedSongs []Song
-		if songOffset < totalSongs {
-			end := songOffset + songCount
-			if end > totalSongs {
-				end = totalSongs
-			}
-			pagedSongs = allMatched[songOffset:end]
-		}
-
-		songs := []map[string]interface{}{}
-		for _, s := range pagedSongs {
-			songs = append(songs, songToMap(s, currentUserPtr))
-		}
-
-		if f == "json" {
-			searchObj := map[string]interface{}{
-				"artist": []interface{}{},
-				"album":  []interface{}{},
-				"song":   songs,
-			}
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"searchResult2": searchObj,
-				"searchResult3": searchObj,
-			})
-		} else {
-			rootTag := "searchResult3"
-			if path == "search2" {
-				rootTag = "searchResult2"
-			}
-			var b strings.Builder
-			b.WriteString(fmt.Sprintf(`<%s>`, rootTag))
-			for _, s := range pagedSongs {
-				b.WriteString(fmt.Sprintf(`<song id="%s" title="%s" artist="%s" album="Online Search" duration="%d" coverArt="%s"/>`,
-					s.YTID, xmlEscape(s.Title), xmlEscape(s.Artist), s.Duration, s.YTID))
-			}
-			b.WriteString(fmt.Sprintf(`</%s>`, rootTag))
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "getalbumlist", "getalbumlist2":
-		listType := r.URL.Query().Get("type")
-		if listType == "" {
-			listType = "newest"
-		}
-		size, _ := strconv.Atoi(r.URL.Query().Get("size"))
-		if size <= 0 {
-			size = 20
-		}
-		mu.RLock()
-		type item struct {
-			s Song
-			t time.Time
-		}
-		var list []item
-		for _, s := range appDB.Songs {
-			var t time.Time
-			switch listType {
-			case "recent", "recentlyplayed":
-				t, _ = time.Parse(time.RFC3339, s.LastPlayed)
-			case "starred":
-				if currentUserPtr != nil && currentUserPtr.Starred != nil && !currentUserPtr.Starred[s.YTID] {
-					continue
-				}
-				t, _ = time.Parse(time.RFC3339, s.LastPlayed)
-				if t.IsZero() {
-					t, _ = time.Parse(time.RFC3339, s.AddedAt)
-				}
-			default:
-				t, _ = time.Parse(time.RFC3339, s.AddedAt)
-			}
-			list = append(list, item{s, t})
-		}
-		mu.RUnlock()
-
-		switch listType {
-		case "frequent":
-			sort.Slice(list, func(i, j int) bool { return list[i].s.PlayCount > list[j].s.PlayCount })
-		case "highest":
-			sort.Slice(list, func(i, j int) bool { return list[i].s.Rating > list[j].s.Rating })
-		case "random":
-			for i := range list {
-				j := int(time.Now().UnixNano()+int64(i)) % len(list)
-				list[i], list[j] = list[j], list[i]
-			}
-		default:
-			sort.Slice(list, func(i, j int) bool { return list[i].t.After(list[j].t) })
-		}
-
-		if len(list) > size {
-			list = list[:size]
-		}
-		albums := []map[string]interface{}{}
-		for _, it := range list {
-			albums = append(albums, map[string]interface{}{
-				"id":        "al-" + it.s.YTID,
-				"name":      it.s.Title,
-				"artist":    it.s.Artist,
-				"artistId":  "ar-1",
-				"coverArt":  it.s.YTID,
-				"songCount": 1,
-				"created":   it.s.AddedAt,
-				"playCount": it.s.PlayCount,
-			})
-		}
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{"albumList": map[string]interface{}{"album": albums}, "albumList2": map[string]interface{}{"album": albums}})
-		} else {
-			var b strings.Builder
-			b.WriteString(`<albumList2>`)
-			for _, a := range albums {
-				b.WriteString(fmt.Sprintf(`<album id="%v" name="%v" artist="%v" coverArt="%v" songCount="1"/>`, a["id"], xmlEscape(fmt.Sprint(a["name"])), xmlEscape(fmt.Sprint(a["artist"])), a["coverArt"]))
-			}
-			b.WriteString(`</albumList2>`)
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "getrandomsongs":
-		size, _ := strconv.Atoi(r.URL.Query().Get("size"))
-		if size <= 0 {
-			size = 20
-		}
-		mu.RLock()
-		var songs []Song
-		for _, s := range appDB.Songs {
-			songs = append(songs, s)
-		}
-		mu.RUnlock()
-
-		for i := range songs {
-			j := int(time.Now().UnixNano()+int64(i)) % len(songs)
-			songs[i], songs[j] = songs[j], songs[i]
-		}
-		if len(songs) > size {
-			songs = songs[:size]
-		}
-		out := []map[string]interface{}{}
-		for _, s := range songs {
-			out = append(out, songToMap(s, currentUserPtr))
-		}
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{"randomSongs": map[string]interface{}{"song": out}})
-		} else {
-			var b strings.Builder
-			b.WriteString(`<randomSongs>`)
-			for _, s := range songs {
-				b.WriteString(fmt.Sprintf(`<song id="%s" title="%s" artist="%s"/>`, s.YTID, xmlEscape(s.Title), xmlEscape(s.Artist)))
-			}
-			b.WriteString(`</randomSongs>`)
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "star":
-		id := r.URL.Query().Get("id")
-		if id != "" && currentUser != "" {
-			mu.Lock()
-			user, ok := appDB.Users[currentUser]
-			if !ok {
-				user = User{
-					Username:  currentUser,
-					Starred:   make(map[string]bool),
-					PlayCount: make(map[string]int),
-				}
-			}
-			if user.Starred == nil {
-				user.Starred = make(map[string]bool)
-			}
-			user.Starred[id] = true
-			appDB.Users[currentUser] = user
-			mu.Unlock()
-			saveDB()
-		}
-		writeSubsonicOK(w, f, map[string]interface{}{})
-
-	case "unstar":
-		id := r.URL.Query().Get("id")
-		if id != "" && currentUser != "" {
-			mu.Lock()
-			if user, ok := appDB.Users[currentUser]; ok && user.Starred != nil {
-				delete(user.Starred, id)
-				appDB.Users[currentUser] = user
-			}
-			mu.Unlock()
-			saveDB()
-		}
-		writeSubsonicOK(w, f, map[string]interface{}{})
-
-	case "getstarred", "getstarred2":
-		var starred []map[string]interface{}
-		mu.RLock()
-		if currentUserPtr != nil && len(currentUserPtr.Starred) > 0 {
-			for sid := range currentUserPtr.Starred {
-				if s, ok := appDB.Songs[sid]; ok {
-					starred = append(starred, songToMap(s, currentUserPtr))
-				}
-			}
-		}
-		mu.RUnlock()
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{"starred": map[string]interface{}{"song": starred}, "starred2": map[string]interface{}{"song": starred}})
-		} else {
-			var b strings.Builder
-			b.WriteString(`<starred2>`)
-			for _, s := range starred {
-				b.WriteString(fmt.Sprintf(`<song id="%v" title="%v"/>`, s["id"], xmlEscape(fmt.Sprint(s["title"]))))
-			}
-			b.WriteString(`</starred2>`)
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "setrating":
-		id := r.URL.Query().Get("id")
-		rating, _ := strconv.Atoi(r.URL.Query().Get("rating"))
-		mu.Lock()
-		if s, ok := appDB.Songs[id]; ok {
-			s.Rating = rating
-			appDB.Songs[id] = s
-			mu.Unlock()
-			saveDB()
-		} else {
-			mu.Unlock()
-		}
-		writeSubsonicOK(w, f, map[string]interface{}{})
-
-	case "scrobble":
-		id := r.URL.Query().Get("id")
-		if id != "" {
-			mu.Lock()
-			if s, ok := appDB.Songs[id]; ok {
-				s.PlayCount++
-				s.LastPlayed = time.Now().Format(time.RFC3339)
-				appDB.Songs[id] = s
-			}
-			if u, ok := appDB.Users[currentUser]; ok {
-				if u.PlayCount == nil {
-					u.PlayCount = make(map[string]int)
-				}
-				if u.LastPlayed == nil {
-					u.LastPlayed = make(map[string]string)
-				}
-				u.PlayCount[id]++
-				u.LastPlayed[id] = time.Now().Format(time.RFC3339)
-				appDB.Users[currentUser] = u
-			}
-			mu.Unlock()
-			saveDB()
-		}
-		writeSubsonicOK(w, f, map[string]interface{}{})
-
-	case "getplaylists":
-		mu.RLock()
-		var pls []map[string]interface{}
-		for _, p := range appDB.Playlists {
-			if p.Owner == currentUser || p.Public || isAdmin(r) || p.Owner == "admin" {
-				pls = append(pls, map[string]interface{}{
-					"id": p.ID, "name": p.Name, "songCount": len(p.SongIDs),
-					"created": p.Created, "changed": p.Changed, "owner": p.Owner, "public": p.Public,
-					"comment": p.YTURL,
-				})
-			}
-		}
-		mu.RUnlock()
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{"playlists": map[string]interface{}{"playlist": pls}})
-		} else {
-			var b strings.Builder
-			b.WriteString(`<playlists>`)
-			for _, p := range pls {
-				b.WriteString(fmt.Sprintf(`<playlist id="%v" name="%v" songCount="%v"/>`, p["id"], xmlEscape(fmt.Sprint(p["name"])), p["songCount"]))
-			}
-			b.WriteString(`</playlists>`)
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "getplaylist":
-		id := r.URL.Query().Get("id")
-		mu.RLock()
-		pl, ok := appDB.Playlists[id]
-		var songs []map[string]interface{}
-		if ok {
-			for _, sid := range pl.SongIDs {
-				if s, ok := appDB.Songs[sid]; ok {
-					songs = append(songs, songToMap(s, currentUserPtr))
-				}
-			}
-		}
-		mu.RUnlock()
-
-		if !ok {
-			writeSubsonicError(w, 70, "Playlist not found", f)
-			return
-		}
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"playlist": map[string]interface{}{
-					"id": pl.ID, "name": pl.Name, "songCount": len(pl.SongIDs), "entry": songs,
-				},
-			})
-		} else {
-			var b strings.Builder
-			b.WriteString(fmt.Sprintf(`<playlist id="%s" name="%s" songCount="%d">`, pl.ID, xmlEscape(pl.Name), len(pl.SongIDs)))
-			for _, s := range songs {
-				b.WriteString(fmt.Sprintf(`<entry id="%v" title="%v"/>`, s["id"], xmlEscape(fmt.Sprint(s["title"]))))
-			}
-			b.WriteString(`</playlist>`)
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "createplaylist":
-		name := r.URL.Query().Get("name")
-		if name == "" {
-			name = "New Playlist"
-		}
-		id := fmt.Sprintf("pl-%d", time.Now().UnixNano())
-		now := time.Now().Format(time.RFC3339)
-		ids := r.URL.Query()["songId"]
-
-		pl := Playlist{
-			ID: id, Name: name, SongIDs: ids, Created: now,
-			Changed: now, Owner: currentUser, Public: false,
-		}
-		mu.Lock()
-		appDB.Playlists[id] = pl
-		mu.Unlock()
-		saveDB()
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{"playlist": map[string]interface{}{"id": id, "name": name, "songCount": len(ids)}})
-		} else {
-			writeSubsonicOK(w, f, fmt.Sprintf(`<playlist id="%s" name="%s" songCount="%d"/>`, id, xmlEscape(name), len(ids)))
-		}
-
-	case "updateplaylist":
-		id := r.URL.Query().Get("id")
-		mu.Lock()
-		pl, ok := appDB.Playlists[id]
-		if !ok {
-			mu.Unlock()
-			writeSubsonicError(w, 70, "Playlist not found", f)
-			return
-		}
-		if pl.Owner != currentUser && !isAdmin(r) {
-			mu.Unlock()
-			writeSubsonicError(w, 50, "Unauthorized: Not your playlist", f)
-			return
-		}
-		if name := r.URL.Query().Get("name"); name != "" {
-			pl.Name = name
-		}
-		for _, sid := range r.URL.Query()["songIdToAdd"] {
-			found := false
-			for _, existing := range pl.SongIDs {
-				if existing == sid {
-					found = true
-					break
-				}
-			}
-			if !found {
-				pl.SongIDs = append(pl.SongIDs, sid)
-			}
-		}
-		if idxStr := r.URL.Query().Get("songIndexToRemove"); idxStr != "" {
-			idx, _ := strconv.Atoi(idxStr)
-			if idx >= 0 && idx < len(pl.SongIDs) {
-				pl.SongIDs = append(pl.SongIDs[:idx], pl.SongIDs[idx+1:]...)
-			}
-		}
-		pl.Changed = time.Now().Format(time.RFC3339)
-		appDB.Playlists[id] = pl
-		mu.Unlock()
-		saveDB()
-		writeSubsonicOK(w, f, map[string]interface{}{})
-
-	case "deleteplaylist":
-		id := r.URL.Query().Get("id")
-		mu.Lock()
-		pl, ok := appDB.Playlists[id]
-		if ok && (pl.Owner == currentUser || isAdmin(r)) {
-			delete(appDB.Playlists, id)
-			mu.Unlock()
-			saveDB()
-		} else {
-			mu.Unlock()
-		}
-		writeSubsonicOK(w, f, map[string]interface{}{})
-
-	case "getlyrics":
-		id := r.URL.Query().Get("id")
-		artist := r.URL.Query().Get("artist")
-		title := r.URL.Query().Get("title")
-
-		cleanID := strings.TrimPrefix(strings.TrimPrefix(id, "al-"), "ar-")
-
-		var lyrics string
-		if cleanID != "" {
-			lyrics = getLyricsForSong(cleanID)
-		}
-		if lyrics == "" && title != "" {
-			lyrics = fetchLyrics(artist, title)
-		}
-
-		if strings.TrimSpace(lyrics) == "" {
-			writeSubsonicError(w, 70, "Lyrics not found", f)
-			return
-		}
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"lyrics": map[string]interface{}{
-					"artist": artist,
-					"title":  title,
-					"value":  lyrics,
-				},
-			})
-		} else {
-			writeSubsonicOK(w, f, fmt.Sprintf(`<lyrics artist="%s" title="%s">%s</lyrics>`, xmlEscape(artist), xmlEscape(title), xmlEscape(lyrics)))
-		}
-
-	case "getlyricsbysongid":
-		id := r.URL.Query().Get("id")
-		cleanID := strings.TrimPrefix(strings.TrimPrefix(id, "al-"), "ar-")
-		if cleanID == "" {
-			writeSubsonicError(w, 10, "Missing id", f)
-			return
-		}
-
-		lyrics := getLyricsForSong(cleanID)
-		if strings.TrimSpace(lyrics) == "" {
-			writeSubsonicError(w, 70, "Lyrics not found", f)
-			return
-		}
-
-		mu.RLock()
-		s := appDB.Songs[cleanID]
-		mu.RUnlock()
-
-		var lineObjs []map[string]interface{}
-		for _, line := range strings.Split(lyrics, "\n") {
-			l := strings.TrimSpace(line)
-			if l != "" {
-				lineObjs = append(lineObjs, map[string]interface{}{"value": l})
-			}
-		}
-
-		if len(lineObjs) == 0 {
-			writeSubsonicError(w, 70, "Lyrics not found", f)
-			return
-		}
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"lyricsList": map[string]interface{}{
-					"structuredLyrics": []map[string]interface{}{{
-						"lang":          "und",
-						"displayArtist": s.Artist,
-						"displayTitle":  s.Title,
-						"offset":        0,
-						"synced":        false,
-						"line":          lineObjs,
-					}},
-				},
-			})
-		} else {
-			var b strings.Builder
-			b.WriteString(`<lyricsList><structuredLyrics lang="und" synced="false">`)
-			for _, lo := range lineObjs {
-				b.WriteString(fmt.Sprintf(`<line value="%s"/>`, xmlEscape(fmt.Sprint(lo["value"]))))
-			}
-			b.WriteString(`</structuredLyrics></lyricsList>`)
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "getuser":
-		username := r.URL.Query().Get("username")
-		if username == "" {
-			username = currentUser
-		}
-		mu.RLock()
-		u, exists := appDB.Users[username]
-		mu.RUnlock()
-		if !exists && username != "admin" {
-			writeSubsonicError(w, 70, "User not found", f)
-			return
-		}
-		_ = u
-		adminU, _ := getAdminCreds()
-		userMap := map[string]interface{}{
-			"username":          username,
-			"email":             username + "@local",
-			"adminRole":         username == adminU,
-			"settingsRole":      true,
-			"downloadRole":      true,
-			"uploadRole":        true,
-			"playlistRole":      true,
-			"coverArtRole":      true,
-			"commentRole":       true,
-			"podcastRole":       true,
-			"streamRole":        true,
-			"jukeboxRole":       false,
-			"shareRole":         false,
-			"scrobblingEnabled": true,
-		}
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{"user": userMap})
-		} else {
-			writeSubsonicOK(w, f, fmt.Sprintf(`<user username="%s" email="%s@local" adminRole="%v" settingsRole="true" downloadRole="true" uploadRole="true" playlistRole="true" coverArtRole="true" commentRole="true" podcastRole="true" streamRole="true" jukeboxRole="false" shareRole="false" scrobblingEnabled="true"/>`, username, username, username == adminU))
-		}
-
-	case "getusers":
-		if !isAdmin(r) {
-			writeSubsonicError(w, 50, "Admin required", f)
-			return
-		}
-		mu.RLock()
-		var uList []map[string]interface{}
-		adminU, _ := getAdminCreds()
-		for _, u := range appDB.Users {
-			uList = append(uList, map[string]interface{}{
-				"username":     u.Username,
-				"email":        u.Username + "@local",
-				"adminRole":    u.Username == adminU,
-				"playlistRole": true,
-				"streamRole":   true,
-			})
-		}
-		mu.RUnlock()
-
-		if f == "json" {
-			writeSubsonicOK(w, f, map[string]interface{}{
-				"users": map[string]interface{}{"user": uList},
-			})
-		} else {
-			var b strings.Builder
-			b.WriteString(`<users>`)
-			for _, u := range uList {
-				b.WriteString(fmt.Sprintf(`<user username="%s" adminRole="%v"/>`, u["username"], u["adminRole"]))
-			}
-			b.WriteString(`</users>`)
-			writeSubsonicOK(w, f, b.String())
-		}
-
-	case "createuser":
-		if !isAdmin(r) {
-			writeSubsonicError(w, 50, "User is not authorized", f)
-			return
-		}
-		username := strings.TrimSpace(r.URL.Query().Get("username"))
-		password := r.URL.Query().Get("password")
-		if username == "" || password == "" {
-			writeSubsonicError(w, 10, "Required parameter is missing", f)
-			return
-		}
-		mu.Lock()
-		if _, exists := appDB.Users[username]; exists {
-			mu.Unlock()
-			writeSubsonicError(w, 10, "User already exists", f)
-			return
-		}
-		appDB.Users[username] = User{
-			Username:   username,
-			Password:   password,
-			Starred:    make(map[string]bool),
-			PlayCount:  make(map[string]int),
-			LastPlayed: make(map[string]string),
-		}
-		mu.Unlock()
-		saveDB()
-		writeSubsonicOK(w, f, map[string]interface{}{})
-
-	case "changepassword":
-		username := strings.TrimSpace(r.URL.Query().Get("username"))
-		newPass := r.URL.Query().Get("password")
-		if username == "" {
-			username = currentUser
-		}
-		if username != currentUser && !isAdmin(r) {
-			writeSubsonicError(w, 50, "Unauthorized to change another user's password", f)
-			return
-		}
-		mu.Lock()
-		if u, ok := appDB.Users[username]; ok {
-			u.Password = newPass
-			appDB.Users[username] = u
-			mu.Unlock()
-			saveDB()
-			writeSubsonicOK(w, f, map[string]interface{}{})
-			return
-		}
-		mu.Unlock()
-		writeSubsonicError(w, 70, "User not found", f)
-
-	case "deleteuser":
-		if !isAdmin(r) {
-			writeSubsonicError(w, 50, "Admin required", f)
-			return
-		}
-		username := strings.TrimSpace(r.URL.Query().Get("username"))
-		adminU, _ := getAdminCreds()
-		if username == "" || username == adminU {
-			http.Error(w, "Cannot delete admin account", 400)
-			return
-		}
-		mu.Lock()
-		delete(appDB.Users, username)
-		mu.Unlock()
-		saveDB()
-		writeSubsonicOK(w, f, map[string]interface{}{})
-
-	default:
-		writeSubsonicOK(w, f, map[string]interface{}{})
-	}
+	respond(w,r,map[string]interface{}{"playlists":map[string]interface{}{"playlist":list}})
 }
-
-// -------------------- Streaming Engine --------------------
-
-func playHandler(w http.ResponseWriter, r *http.Request) {
-	ytUrl := r.URL.Query().Get("url")
-	if ytUrl == "" {
-		http.Error(w, "Missing YouTube URL", 400)
-		return
-	}
-
-	ytID := ytUrl
-	if strings.Contains(ytUrl, "youtu.be/") {
-		ytID = strings.Split(strings.Split(ytUrl, "youtu.be/")[1], "?")[0]
-		ytID = strings.Split(ytID, "&")[0]
-	} else if strings.Contains(ytUrl, "v=") {
-		ytID = strings.Split(strings.Split(ytUrl, "v=")[1], "&")[0]
-	}
-
-	mu.RLock()
-	song, exists := appDB.Songs[ytID]
-	mu.RUnlock()
-
-	// 1. Instant stream from Telegram cache
-	if exists && song.FileID != "" {
-		token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
-		fp := song.FilePath
-		if fp == "" {
-			fp = getTelegramFilePath(song.FileID)
-		}
-		if token != "" && fp != "" {
-			proxyTelegramAudio(w, r, token, fp)
-			return
-		}
-	}
-
-	sem <- struct{}{}
-	defer func() { <-sem }()
-
-	targetFile := filepath.Join("/tmp", ytID+".m4a")
-
-	// 2. Instant stream from local disk
-	if _, err := os.Stat(targetFile); err == nil {
-		w.Header().Set("Content-Type", "audio/mp4")
-		http.ServeFile(w, r, targetFile)
-		return
-	}
-
-	title := song.Title
-	if title == "" {
-		title = ytID
-	}
-	artist := song.Artist
-	if artist == "" {
-		artist = "YouTube"
-	}
-
-	cookieArgs := getCookiesArg()
-
-	execCtx, execCancel := context.WithTimeout(context.Background(), 75*time.Second)
-	defer execCancel()
-
-	outputTemplate := filepath.Join("/tmp", ytID+".%(ext)s")
-
-	var ytArgs []string
-	if len(cookieArgs) > 0 {
-		ytArgs = append(ytArgs, cookieArgs...)
-	}
-
-	ytArgs = append(ytArgs,
-		"-f", "bestaudio/best",
-		"-x", "--audio-format", "m4a",
-		"--audio-quality", "0",
-		"--no-playlist",
-		"--no-check-certificate",
-		"--no-warnings",
-		"--geo-bypass",
-		"--socket-timeout", "25",
-		"--retries", "3",
-		"--extractor-args", "youtube:player_client=android,tv",
-		"-o", outputTemplate,
-		"https://www.youtube.com/watch?v="+ytID,
-	)
-
-	cmd := exec.CommandContext(execCtx, "yt-dlp", ytArgs...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		errMsg := string(out)
-		log.Printf("[YT Stream Error] yt-dlp failed for %s: %v | Log: %s", ytID, err, errMsg)
-
-		userMsg := "YouTube extraction failed"
-		switch {
-		case strings.Contains(errMsg, "The page needs to be reloaded"):
-			userMsg = "YouTube blocked this request (page reload needed). Try again later."
-		case strings.Contains(errMsg, "Requested format is not available"):
-			userMsg = "Audio format not available for this video."
-		case strings.Contains(errMsg, "Sign in to confirm"):
-			userMsg = "This video requires sign-in / age verification."
-		case strings.Contains(errMsg, "Private video"):
-			userMsg = "This is a private YouTube video."
-		case strings.Contains(errMsg, "Video unavailable"):
-			userMsg = "Video is unavailable or deleted."
-		case strings.Contains(errMsg, "confirm your age"):
-			userMsg = "Age-restricted video. Cookies may be needed."
-		case strings.Contains(errMsg, "HTTP Error 403"):
-			userMsg = "YouTube returned 403 Forbidden (IP/cookies issue)."
-		case strings.Contains(errMsg, "timed out") || strings.Contains(errMsg, "timeout"):
-			userMsg = "YouTube request timed out. Try again."
-		}
-
-		http.Error(w, userMsg, 500)
-		return
-	}
-
-	// Smart file locator
-	matches, _ := filepath.Glob(filepath.Join("/tmp", ytID+"*"))
-	var foundFile string
-	for _, m := range matches {
-		if strings.HasSuffix(m, ".m4a") || strings.HasSuffix(m, ".mp3") || strings.HasSuffix(m, ".webm") || strings.HasSuffix(m, ".opus") {
-			foundFile = m
-			break
-		}
-	}
-
-	if foundFile == "" {
-		log.Printf("[YT Stream Error] No valid audio file found for %s", ytID)
-		http.Error(w, "Audio file could not be extracted from YouTube.", 500)
-		return
-	}
-
-	if foundFile != targetFile {
-		os.Rename(foundFile, targetFile)
-	}
-
-	now := time.Now().Format(time.RFC3339)
-	token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
-	chatID := strings.TrimSpace(os.Getenv("CHANNEL_ID"))
-
-	// Background Telegram upload
-	if token != "" && chatID != "" {
-		go func(tPath, sTitle, sID string) {
-			if f, err := os.Open(tPath); err == nil {
-				defer f.Close()
-				body := &bytes.Buffer{}
-				writer := multipart.NewWriter(body)
-				part, _ := writer.CreateFormFile("audio", filepath.Base(tPath))
-				io.Copy(part, f)
-				writer.WriteField("chat_id", chatID)
-				writer.WriteField("caption", sTitle)
-				writer.Close()
-
-				req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendAudio", token), body)
-				req.Header.Set("Content-Type", writer.FormDataContentType())
-				client := &http.Client{Timeout: 90 * time.Second}
-				if resp, err := client.Do(req); err == nil {
-					defer resp.Body.Close()
-					var res struct {
-						Ok     bool `json:"ok"`
-						Result struct {
-							Audio struct {
-								FileID string `json:"file_id"`
-							} `json:"audio"`
-						} `json:"result"`
-					}
-					if json.NewDecoder(resp.Body).Decode(&res) == nil && res.Ok {
-						uFileID := res.Result.Audio.FileID
-						uFp := getTelegramFilePath(uFileID)
-						mu.Lock()
-						if s, ok := appDB.Songs[sID]; ok {
-							s.FileID = uFileID
-							s.FilePath = uFp
-							appDB.Songs[sID] = s
-						}
-						mu.Unlock()
-						saveDB()
-					}
-				}
-			}
-		}(targetFile, title, ytID)
-	}
-
-	exactDur := getAudioDuration(targetFile)
-	if exactDur <= 0 {
-		exactDur = song.Duration
-	}
-	if exactDur <= 0 {
-		exactDur = 180
-	}
-
-	mu.Lock()
-	existing := appDB.Songs[ytID]
-	s := Song{
-		YTID:       ytID,
-		Title:      title,
-		Artist:     artist,
-		FileID:     existing.FileID,
-		FilePath:   existing.FilePath,
-		AddedAt:    existing.AddedAt,
-		PlayCount:  existing.PlayCount + 1,
-		LastPlayed: now,
-		Starred:    existing.Starred,
-		Rating:     existing.Rating,
-		Duration:   exactDur,
-		CoverArt:   fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", ytID),
-	}
-	if s.AddedAt == "" {
-		s.AddedAt = now
-	}
-	appDB.Songs[ytID] = s
-	mu.Unlock()
-	saveDB()
-
-	w.Header().Set("Content-Type", "audio/mp4")
-	http.ServeFile(w, r, targetFile)
+func handleGetPlaylist(w http.ResponseWriter,r *http.Request){
+	if ok,_:=checkAuth(r); !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	id:=r.URL.Query().Get("id")
+	db.RLock(); pl,ok:=db.Playlists[id]; db.RUnlock()
+	if !ok{ writeJSON(w,200,subFail("not found",70)); return }
+	db.RLock()
+	var songs []map[string]interface{}
+	for _,sid:=range pl.SongIDs{ if s,ok:=db.Songs[sid]; ok{ songs=append(songs,songToSubsonic(s,r)) } }
+	db.RUnlock()
+	respond(w,r,map[string]interface{}{"playlist":map[string]interface{}{"id":pl.ID,"name":pl.Name,"owner":pl.Owner,"songCount":len(songs),"entry":songs,"created":pl.Created,"public":pl.Public,"comment":pl.Comment}})
 }
-
-// -------------------- Multi-User True Mirror Sync --------------------
-
-func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
-	if maxVideos <= 0 {
-		maxVideos = 50
+func handleCreatePlaylist(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	name:=r.URL.Query().Get("name"); if name==""{ name="New Playlist" }
+	id:="pl_"+fmt.Sprintf("%d",time.Now().UnixNano())
+	pl:=&Playlist{ID:id,Name:name,Owner:user,SongIDs:[]string{},Created:time.Now().Format(time.RFC3339)}
+	db.Lock(); db.Playlists[id]=pl; db.Unlock()
+	db.save()
+	respond(w,r,map[string]interface{}{"playlist":map[string]interface{}{"id":pl.ID,"name":pl.Name}})
+}
+func handleUpdatePlaylist(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	id:=r.URL.Query().Get("playlistId"); if id==""{ id=r.URL.Query().Get("id") }
+	name:=r.URL.Query().Get("name")
+	toAdd:=r.URL.Query()["songIdToAdd"]
+	toRemoveIdxStr:=r.URL.Query()["songIndexToRemove"]
+	db.Lock()
+	pl,ok:=db.Playlists[id]
+	if !ok{ db.Unlock(); writeJSON(w,200,subFail("not found",70)); return }
+	if pl.Owner!=user && user!=cfg.SubUser{ db.Unlock(); writeJSON(w,200,subFail("not owner",50)); return }
+	if name!=""{ pl.Name=name }
+	for _,sid:=range toAdd{ if _,exists:=db.Songs[sid]; exists{ if !contains(pl.SongIDs,sid){ pl.SongIDs=append(pl.SongIDs,sid) } } }
+	if len(toRemoveIdxStr)>0{
+		var idxs []int
+		for _,s:=range toRemoveIdxStr{ if i,err:=strconv.Atoi(s); err==nil{ idxs=append(idxs,i) } }
+		for a:=0;a<len(idxs);a++{ for b:=a+1;b<len(idxs);b++{ if idxs[a]<idxs[b]{ idxs[a],idxs[b]=idxs[b],idxs[a] } } }
+		for _,idx:=range idxs{ if idx>=0&&idx<len(pl.SongIDs){ pl.SongIDs=append(pl.SongIDs[:idx],pl.SongIDs[idx+1:]...) } }
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
-
-	cookieArgs := getCookiesArg()
-	var args []string
-	if len(cookieArgs) > 0 {
-		args = append(args, cookieArgs...)
+	db.Unlock()
+	db.save(); go telegramUploadDB()
+	respond(w,r,map[string]interface{}{})
+}
+func handleDeletePlaylist(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	id:=r.URL.Query().Get("id")
+	db.Lock()
+	if pl,ok:=db.Playlists[id]; ok{ if pl.Owner==user||user==cfg.SubUser{ delete(db.Playlists,id) } }
+	db.Unlock()
+	db.save()
+	respond(w,r,map[string]interface{}{})
+}
+func handleImportYT(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	u:=r.URL.Query().Get("url"); if u==""{ u=r.URL.Query().Get("id") }; if u==""{ u=r.URL.Query().Get("playlistId") }
+	pl,err:=importYoutubePlaylist(u,user)
+	if err!=nil{ writeJSON(w,200,subFail(err.Error(),0)); return }
+	respond(w,r,map[string]interface{}{"playlist":map[string]interface{}{"id":pl.ID,"name":pl.Name,"songCount":len(pl.SongIDs)}})
+}
+func handleCreateUser(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	if user!=cfg.SubUser{ writeJSON(w,200,subFail("only admin",50)); return }
+	newU:=r.URL.Query().Get("username"); newP:=r.URL.Query().Get("password")
+	if newU==""||newP==""{ writeJSON(w,200,subFail("username password required",10)); return }
+	muUsers.Lock(); usersMap[newU]=newP; muUsers.Unlock()
+	db.Lock(); db.Users[newU]=newP; db.Unlock()
+	db.save(); go telegramUploadDB()
+	respond(w,r,map[string]interface{}{"user":map[string]interface{}{"username":newU}})
+}
+func handleGetUsers(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok||user!=cfg.SubUser{ writeJSON(w,200,subFail("admin only",50)); return }
+	muUsers.RLock()
+	var list []map[string]interface{}
+	for u := range usersMap{ list=append(list,map[string]interface{}{"username":u,"adminRole":u==cfg.SubUser}) }
+	muUsers.RUnlock()
+	respond(w,r,map[string]interface{}{"users":map[string]interface{}{"user":list}})
+}
+func handleStar(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	ids:=r.URL.Query()["id"]
+	db.Lock()
+	if _,ok:=db.Starred[user]; !ok{ db.Starred[user]=make(map[string]bool) }
+	for _,id:=range ids{ db.Starred[user][id]=true }
+	db.Unlock()
+	db.save()
+	respond(w,r,map[string]interface{}{})
+}
+func handleUnstar(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	ids:=r.URL.Query()["id"]
+	db.Lock()
+	if m,ok:=db.Starred[user]; ok{
+		for _,id:=range ids{ delete(m,id) }
 	}
-	args = append(args,
-		"--flat-playlist",
-		"--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s",
-		"--no-download",
-		"--playlist-end", fmt.Sprintf("%d", maxVideos),
-		"--extractor-args", "youtube:player_client=android,tv",
-		playlistURL,
-	)
-
-	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("yt-dlp error: %v", err)
+	db.Unlock()
+	db.save()
+	respond(w,r,map[string]interface{}{})
+}
+func handleGetStarred(w http.ResponseWriter,r *http.Request){
+	ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+	db.RLock()
+	starMap:=db.Starred[user]
+	var songs []map[string]interface{}
+	for sid := range starMap{
+		if s,ok:=db.Songs[sid]; ok{
+			songs=append(songs,songToSubsonic(s,r))
+		}
 	}
+	db.RUnlock()
+	respond(w,r,map[string]interface{}{"starred":map[string]interface{}{"song":songs}})
+}
+func handleGetStarred2(w http.ResponseWriter,r *http.Request){ handleGetStarred(w,r) }
+func handleScrobble(w http.ResponseWriter,r *http.Request){
+	id:=r.URL.Query().Get("id")
+	if id!=""{
+		db.Lock(); if s,ok:=db.Songs[id]; ok{ s.PlayCount++ }; db.Unlock()
+	}
+	respond(w,r,map[string]interface{}{})
+}
+func handleScanStatus(w http.ResponseWriter,r *http.Request){ respond(w,r,map[string]interface{}{"scanStatus":map[string]interface{}{"scanning":false,"count":len(db.Songs)}}) }
 
-	now := time.Now().Format(time.RFC3339)
-	var songs []Song
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "WARNING") || strings.HasPrefix(line, "ERROR") {
-			continue
-		}
-		parts := strings.Split(line, "|||")
-		if len(parts) < 2 {
-			continue
-		}
-		id := strings.TrimSpace(parts[0])
-		title := strings.TrimSpace(parts[1])
-		artist := "YouTube"
-		if len(parts) >= 3 && strings.TrimSpace(parts[2]) != "" {
-			artist = strings.TrimSpace(parts[2])
-		}
-		dur := 180
-		if len(parts) >= 4 {
-			if d, err := strconv.Atoi(strings.TrimSpace(parts[3])); err == nil && d > 0 {
-				dur = d
+const adminHTML = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Subsonic TG Cache v3.0</title><script src="https://cdn.tailwindcss.com"></script><style>.mono{font-family:ui-monospace,Menlo,monospace}</style></head><body class="bg-[#0a0a0a] text-zinc-100 min-h-screen"><div class="max-w-6xl mx-auto p-4">
+<div class="border border-zinc-800 rounded-2xl p-4 bg-zinc-900/40 flex flex-wrap justify-between gap-3"><div><div class="text-xl font-bold">🎵 Subsonic v3.0 TG Cache</div><div class="text-xs text-zinc-500 mono">1st Play → TG Cache → Next Play TG Direct (No yt-dlp) • Album Art • Offline • Favourite</div></div><div class="flex gap-2"><input id="srv" placeholder="https://app.koyeb.app" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm w-56 mono"><input id="au" value="admin" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm w-20"><input id="ap" type="password" value="admin" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm w-20"><button onclick="saveCred()" class="bg-lime-400 text-black px-4 py-2 rounded-lg text-sm font-bold">Save</button></div></div>
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4"><div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4"><div class="text-xs text-zinc-500 mono">SONGS</div><div id="statSongs" class="text-2xl font-bold">-</div></div><div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4"><div class="text-xs text-zinc-500 mono">TG CACHED</div><div id="statCached" class="text-2xl font-bold text-lime-400">-</div><div class="text-[10px] text-zinc-500">no yt-dlp next time</div></div><div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4"><div class="text-xs text-zinc-500 mono">PLAYLISTS</div><div id="statPls" class="text-2xl font-bold">-</div></div><div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4"><div class="text-xs text-zinc-500 mono">USERS</div><div id="statUsers" class="text-2xl font-bold">-</div></div></div>
+<div class="mt-4 bg-zinc-900 border border-zinc-800 rounded-2xl p-5"><div class="font-semibold">▶️ How TG Cache Works (Tune jo bola)</div><div class="text-xs text-zinc-400 mt-2 leading-relaxed">1st play pe: <span class="text-white mono">/rest/stream.view?id=yt_xxx</span> → yt-dlp se direct URL → user ko stream + background me Telegram pe <span class="text-lime-300">sendAudio</span> se upload → file_id DB me save (TgFileID).<br>2nd play se: <span class="text-white mono">telegramGetFileUrl(TgFileID)</span> → TG file server se direct proxy, yt-dlp bilkul nahi chalega. X-Cache header: TG / MISS.<br>Isse Koyeb 512MB me bhi fast, har gaane pe yt-dlp nahi.</div><div class="mt-3 flex gap-2"><input id="yturl" placeholder="YT playlist URL PL..." class="flex-1 bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2.5 text-sm mono"><button onclick="importYT()" class="bg-white text-black px-4 py-2 rounded-lg text-sm font-bold">Import YT</button></div><div id="ytRes" class="mt-2 text-xs mono bg-black border border-zinc-800 rounded p-2 max-h-24 overflow-auto"></div></div>
+<div class="mt-4 grid md:grid-cols-2 gap-4"><div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5"><div class="flex justify-between"><div class="font-semibold">📀 Playlists (cached count)</div><button onclick="loadPlaylists()" class="bg-zinc-800 border border-zinc-700 px-3 py-1 rounded text-xs">Refresh</button></div><div id="pls" class="mt-3 space-y-2 max-h-96 overflow-auto"></div></div><div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5"><div class="flex justify-between"><div class="font-semibold">⭐ Favourites + Offline Download</div><button onclick="loadStarred()" class="bg-zinc-800 border border-zinc-700 px-3 py-1 rounded text-xs">Refresh</button></div><div id="starred" class="mt-3 space-y-2 max-h-96 overflow-auto"></div></div></div>
+<div class="mt-4 bg-zinc-900 border border-zinc-800 rounded-2xl p-5"><div class="font-semibold">🔧 Tester</div><div class="flex flex-wrap gap-2 mt-3"><button onclick="test('ping')" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded text-xs mono">ping</button><button onclick="test('playlists')" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded text-xs mono">getPlaylists</button><button onclick="test('starred')" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded text-xs mono">getStarred</button><button onclick="test('health')" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded text-xs mono">/health</button></div><pre id="apiRes" class="mt-3 bg-black border border-zinc-800 rounded p-3 text-xs mono max-h-64 overflow-auto"></pre></div>
+</div><script>
+function getBase(){return (document.getElementById('srv').value||'').replace(/\/+$/,'')||location.origin}
+function getCred(){return {u:document.getElementById('au').value||'admin',p:document.getElementById('ap').value||'admin'}}
+function saveCred(){localStorage.setItem('sub_srv',document.getElementById('srv').value);localStorage.setItem('sub_u',document.getElementById('au').value);localStorage.setItem('sub_p',document.getElementById('ap').value);toast('Saved');loadStats()}
+function toast(m){let d=document.createElement('div');d.textContent=m;d.className='fixed bottom-4 right-4 bg-zinc-800 border border-zinc-700 text-white px-4 py-2 rounded-lg text-sm';document.body.appendChild(d);setTimeout(()=>d.remove(),2000)}
+async function loadStats(){try{let b=getBase();let r=await fetch(b+'/health');let j=await r.json();document.getElementById('statSongs').textContent=j.songs||0;document.getElementById('statPls').textContent=j.playlists||0;document.getElementById('statUsers').textContent=j.users||0;let cached=0;if(j.songs>0){try{let cr=await fetch(b+'/rest/search3.view?u='+encodeURIComponent(getCred().u)+'&p='+encodeURIComponent(getCred().p)+'&v=1.16.1&c=amcfy&f=json&query=a');let cj=await cr.json();let songs=cj['subsonic-response']?.searchResult3?.song||[];cached=j.cached||0}catch{}}document.getElementById('statCached').textContent=j.cached||'?';}catch{}}
+async function importYT(){let url=document.getElementById('yturl').value.trim();if(!url)return toast('Paste YT URL');let {u,p}=getCred();let base=getBase();document.getElementById('ytRes').textContent='Importing as '+u+'...';try{let api=base+'/rest/importYoutubePlaylist.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json&url='+encodeURIComponent(url);let r=await fetch(api);let j=await r.json();document.getElementById('ytRes').textContent=JSON.stringify(j,null,2);toast('Imported');loadStats();loadPlaylists();}catch(e){document.getElementById('ytRes').textContent='Error:'+e}}
+async function loadPlaylists(){let {u,p}=getCred();let base=getBase();try{let api=base+'/rest/getPlaylists.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json';let r=await fetch(api);let j=await r.json();let list=j['subsonic-response']?.playlists?.playlist||[];if(!Array.isArray(list))list=[list];let html=list.map(pl=>'<div class="bg-black border border-zinc-800 rounded-lg p-3"><div class="flex justify-between"><div><div class="font-medium">'+pl.name+'</div><div class="text-xs text-zinc-500 mono">'+pl.owner+' • '+pl.songCount+' songs • cached '+ (pl.cachedCount||0)+'</div></div><button onclick="viewPl(\''+pl.id+'\')" class="bg-zinc-800 px-2 py-1 rounded text-xs">View</button></div></div>').join('');document.getElementById('pls').innerHTML=html||'No playlists';}catch(e){document.getElementById('pls').textContent='Error:'+e}}
+async function viewPl(id){let {u,p}=getCred();let base=getBase();let api=base+'/rest/getPlaylist.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json&id='+id;let r=await fetch(api);let j=await r.json();document.getElementById('apiRes').textContent=JSON.stringify(j,null,2)}
+async function loadStarred(){let {u,p}=getCred();let base=getBase();try{let api=base+'/rest/getStarred.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json';let r=await fetch(api);let j=await r.json();let songs=j['subsonic-response']?.starred?.song||[];if(!Array.isArray(songs))songs=[songs];let html=songs.map(s=>'<div class="bg-black border border-zinc-800 rounded-lg p-2 flex gap-2 items-center"><img src="'+base+'/rest/getCoverArt.view?id='+s.id+'&u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'" class="w-10 h-10 rounded"><div class="flex-1"><div class="text-sm">'+s.title+'</div><div class="text-xs text-zinc-500">'+s.artist+(s.cached?' • TG cached':'')+'</div></div><a href="'+base+'/rest/download.view?id='+s.id+'&u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'" class="bg-zinc-800 px-2 py-1 rounded text-xs">⬇️</a></div>').join('');document.getElementById('starred').innerHTML=html||'No fav';}catch(e){document.getElementById('starred').textContent='Error:'+e}}
+async function test(w){let {u,p}=getCred();let base=getBase();let url='';if(w==='ping')url=base+'/rest/ping.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&f=json';if(w==='playlists')url=base+'/rest/getPlaylists.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&f=json';if(w==='starred')url=base+'/rest/getStarred.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&f=json';if(w==='health')url=base+'/health';let r=await fetch(url);let t=await r.text();document.getElementById('apiRes').textContent=t.slice(0,4000)}
+window.addEventListener('DOMContentLoaded',()=>{let s=localStorage.getItem('sub_srv');if(s)document.getElementById('srv').value=s;let su=localStorage.getItem('sub_u');if(su)document.getElementById('au').value=su;let sp=localStorage.getItem('sub_p');if(sp)document.getElementById('ap').value=sp;loadStats();loadPlaylists();loadStarred();});
+</script></body></html>`
+
+func main(){
+	cfg=loadConfig()
+	db.load()
+	if len(db.Songs)==0&&cfg.TelegramFileID!=""{
+		telegramDownloadDB()
+		db.load()
+	}
+	os.MkdirAll(filepath.Dir(cfg.DbPath),0755)
+	initUsers()
+	mux:=http.NewServeMux()
+	mux.HandleFunc("/rest/ping.view",handlePing)
+	mux.HandleFunc("/rest/getLicense.view",handleLicense)
+	mux.HandleFunc("/rest/getMusicFolders.view",handleMusicFolders)
+	mux.HandleFunc("/rest/getUser.view",handleGetUser)
+	mux.HandleFunc("/rest/getArtists.view",handleGetArtists)
+	mux.HandleFunc("/rest/getArtist.view",handleGetArtist)
+	mux.HandleFunc("/rest/getAlbum.view",handleGetAlbum)
+	mux.HandleFunc("/rest/getSong.view",handleGetSong)
+	mux.HandleFunc("/rest/search3.view",handleSearch3)
+	mux.HandleFunc("/rest/getAlbumList2.view",handleAlbumList2)
+	mux.HandleFunc("/rest/getRandomSongs.view",handleRandomSongs)
+	mux.HandleFunc("/rest/stream.view",handleStream)
+	mux.HandleFunc("/rest/download.view",handleDownload)
+	mux.HandleFunc("/rest/getCoverArt.view",handleCoverArt)
+	mux.HandleFunc("/rest/getPlaylists.view",handleGetPlaylists)
+	mux.HandleFunc("/rest/getPlaylist.view",handleGetPlaylist)
+	mux.HandleFunc("/rest/createPlaylist.view",handleCreatePlaylist)
+	mux.HandleFunc("/rest/deletePlaylist.view",handleDeletePlaylist)
+	mux.HandleFunc("/rest/updatePlaylist.view",handleUpdatePlaylist)
+	mux.HandleFunc("/rest/importYoutubePlaylist.view",handleImportYT)
+	mux.HandleFunc("/rest/importPlaylist.view",handleImportYT)
+	mux.HandleFunc("/rest/createUser.view",handleCreateUser)
+	mux.HandleFunc("/rest/getUsers.view",handleGetUsers)
+	mux.HandleFunc("/rest/star.view",handleStar)
+	mux.HandleFunc("/rest/unstar.view",handleUnstar)
+	mux.HandleFunc("/rest/getStarred.view",handleGetStarred)
+	mux.HandleFunc("/rest/getStarred2.view",handleGetStarred2)
+	mux.HandleFunc("/rest/scrobble.view",handleScrobble)
+	mux.HandleFunc("/rest/getScanStatus.view",handleScanStatus)
+	mux.HandleFunc("/health",func(w http.ResponseWriter,r *http.Request){
+		cached:=0
+		db.RLock()
+		for _,s:=range db.Songs{ if s.TgFileID!=""{ cached++ } }
+		db.RUnlock()
+		writeJSON(w,200,map[string]interface{}{"status":"ok","songs":len(db.Songs),"playlists":len(db.Playlists),"users":len(usersMap),"cached":cached,"artists":len(db.Artists),"albums":len(db.Albums)})
+	})
+	mux.HandleFunc("/admin/cache-stats",func(w http.ResponseWriter,r *http.Request){
+		ok,user:=checkAuth(r); if !ok{ writeJSON(w,200,subFail("auth",40)); return }
+		cached:=0; var list []map[string]interface{}
+		db.RLock()
+		for _,s:=range db.Songs{
+			if s.TgFileID!=""{
+				cached++
+				list=append(list,map[string]interface{}{"id":s.ID,"title":s.Title,"artist":s.Artist,"cachedAt":s.CachedAt})
 			}
 		}
-		if id == "" || title == "" {
-			continue
-		}
-		songs = append(songs, Song{
-			YTID:     id,
-			Title:    title + " [YT]",
-			Artist:   artist,
-			AddedAt:  now,
-			Duration: dur,
-			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
-		})
-	}
-	return songs, nil
-}
-
-func importOrSyncYouTubePlaylist(playlistURL string, maxVideos int, owner string, plName string) (int, string, error) {
-	freshSongs, err := fetchYTPlaylistSongs(playlistURL, maxVideos)
-	if err != nil {
-		return 0, "", err
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	now := time.Now().Format(time.RFC3339)
-	var currentIDs []string
-
-	addedCount := 0
-	for _, s := range freshSongs {
-		currentIDs = append(currentIDs, s.YTID)
-		if _, exists := appDB.Songs[s.YTID]; !exists {
-			appDB.Songs[s.YTID] = s
-			addedCount++
-		}
-	}
-
-	var targetPlID string
-	for id, pl := range appDB.Playlists {
-		if pl.Owner == owner && pl.YTURL == playlistURL {
-			targetPlID = id
-			break
-		}
-	}
-
-	if targetPlID != "" {
-		pl := appDB.Playlists[targetPlID]
-		if plName != "" {
-			pl.Name = plName
-		}
-		pl.SongIDs = currentIDs
-		pl.Changed = now
-		appDB.Playlists[targetPlID] = pl
-		return addedCount, targetPlID, nil
-	}
-
-	if plName == "" {
-		plName = "YT Playlist " + time.Now().Format("02 Jan 15:04")
-	}
-	targetPlID = fmt.Sprintf("pl-%d", time.Now().UnixNano())
-	appDB.Playlists[targetPlID] = Playlist{
-		ID:      targetPlID,
-		Name:    plName,
-		SongIDs: currentIDs,
-		Created: now,
-		Changed: now,
-		Owner:   owner,
-		Public:  false,
-		YTURL:   playlistURL,
-	}
-
-	return addedCount, targetPlID, nil
-}
-
-func importPlaylistHandler(w http.ResponseWriter, r *http.Request) {
-	currentUser := getCurrentUser(r)
-	if currentUser == "" {
-		adminU, adminP := getAdminCreds()
-		if r.URL.Query().Get("u") == adminU && r.URL.Query().Get("p") == adminP {
-			currentUser = adminU
-		} else {
-			http.Error(w, "Unauthorized: Login required", 401)
-			return
-		}
-	}
-
-	playlistURL := r.URL.Query().Get("url")
-	if playlistURL == "" {
-		http.Error(w, "missing url param", 400)
-		return
-	}
-
-	plName := strings.TrimSpace(r.URL.Query().Get("name"))
-	maxV := 40
-	if m := r.URL.Query().Get("max"); m != "" {
-		if v, err := strconv.Atoi(m); err == nil && v > 0 {
-			maxV = v
-		}
-	}
-
-	added, plID, err := importOrSyncYouTubePlaylist(playlistURL, maxV, currentUser, plName)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	saveDB()
-
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"status":"ok","newSongsAdded":%d,"playlistId":"%s","owner":"%s","message":"Mirror synced with YouTube!"}`, added, plID, currentUser)
-}
-
-// -------------------- Background Mirror Sync Engine --------------------
-
-func startBackgroundSync() {
-	go func() {
-		time.Sleep(30 * time.Second)
-		for {
-			syncAllLinkedPlaylists()
-			time.Sleep(6 * time.Hour)
-		}
+		db.RUnlock()
+		if len(list)>50{ list=list[:50] }
+		respond(w,r,map[string]interface{}{"cachedCount":cached,"songs":list})
+	})
+	mux.HandleFunc("/",func(w http.ResponseWriter,r *http.Request){
+		if r.URL.Path!="/"{ http.NotFound(w,r); return }
+		w.Header().Set("Content-Type","text/html")
+		fmt.Fprint(w,adminHTML)
+	})
+	go func(){
+		ticker:=time.NewTicker(5*time.Minute)
+		for range ticker.C{ db.save(); go telegramUploadDB() }
 	}()
-}
-
-func syncAllLinkedPlaylists() {
-	mu.RLock()
-	type plTask struct {
-		id    string
-		url   string
-		owner string
-		name  string
-	}
-	var tasks []plTask
-	for id, pl := range appDB.Playlists {
-		if pl.YTURL != "" {
-			tasks = append(tasks, plTask{id: id, url: pl.YTURL, owner: pl.Owner, name: pl.Name})
-		}
-	}
-	mu.RUnlock()
-
-	if len(tasks) == 0 {
-		return
-	}
-
-	log.Printf("[AutoSync] Mirror syncing %d YouTube playlists across all users...", len(tasks))
-	hasChanges := false
-
-	for _, t := range tasks {
-		added, _, err := importOrSyncYouTubePlaylist(t.url, 50, t.owner, t.name)
-		if err != nil {
-			log.Printf("[AutoSync] Failed mirroring %s: %v", t.name, err)
-			continue
-		}
-		if added > 0 {
-			hasChanges = true
-		}
-		time.Sleep(3 * time.Second)
-	}
-
-	if hasChanges {
-		log.Println("[AutoSync] Changes detected during mirror sync. Uploading backup to Telegram...")
-		saveDB()
-	}
-}
-
-// -------------------- User & Playlist REST Endpoints --------------------
-
-func listHandler(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(appDB.Songs)
-}
-
-func dbHandler(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, dbPath)
-}
-
-func myPlaylistsHandler(w http.ResponseWriter, r *http.Request) {
-	u := getCurrentUser(r)
-	if u == "" {
-		http.Error(w, "Unauthorized", 401)
-		return
-	}
-
-	mu.RLock()
-	var list []Playlist
-	for _, p := range appDB.Playlists {
-		if p.Owner == u || isAdmin(r) {
-			list = append(list, p)
-		}
-	}
-	mu.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(list)
-}
-
-func syncSpecificPlaylistHandler(w http.ResponseWriter, r *http.Request) {
-	u := getCurrentUser(r)
-	plID := r.URL.Query().Get("id")
-
-	mu.RLock()
-	pl, exists := appDB.Playlists[plID]
-	mu.RUnlock()
-
-	if !exists {
-		http.Error(w, "Playlist not found", 404)
-		return
-	}
-	if pl.Owner != u && !isAdmin(r) {
-		http.Error(w, "Unauthorized", 403)
-		return
-	}
-	if pl.YTURL == "" {
-		http.Error(w, "Not a YouTube synced playlist", 400)
-		return
-	}
-
-	added, _, err := importOrSyncYouTubePlaylist(pl.YTURL, 50, pl.Owner, pl.Name)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	saveDB()
-
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"status":"ok","added":%d,"message":"Synced successfully"}`, added)
-}
-
-func myFavoritesHandler(w http.ResponseWriter, r *http.Request) {
-	u := getCurrentUser(r)
-	if u == "" {
-		http.Error(w, "Unauthorized", 401)
-		return
-	}
-
-	mu.RLock()
-	user, exists := appDB.Users[u]
-	var songs []Song
-	if exists && user.Starred != nil {
-		for sid := range user.Starred {
-			if s, ok := appDB.Songs[sid]; ok {
-				songs = append(songs, s)
-			}
-		}
-	}
-	mu.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(songs)
-}
-
-func registerUserHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-
-	if r.Method == "POST" {
-		json.NewDecoder(r.Body).Decode(&req)
-	}
-	if req.Username == "" {
-		req.Username = r.URL.Query().Get("username")
-		req.Password = r.URL.Query().Get("password")
-	}
-
-	req.Username = strings.TrimSpace(req.Username)
-	if req.Username == "" || req.Password == "" {
-		http.Error(w, `{"status":"error","message":"username and password required"}`, 400)
-		return
-	}
-
-	mu.Lock()
-	if _, exists := appDB.Users[req.Username]; exists {
-		mu.Unlock()
-		http.Error(w, `{"status":"error","message":"user already exists"}`, 400)
-		return
-	}
-
-	appDB.Users[req.Username] = User{
-		Username:   req.Username,
-		Password:   req.Password,
-		Starred:    make(map[string]bool),
-		PlayCount:  make(map[string]int),
-		LastPlayed: make(map[string]string),
-	}
-	mu.Unlock()
-	saveDB()
-
-	log.Printf("[Auth] User registered: %s", req.Username)
-	fmt.Fprintf(w, `{"status":"ok","message":"Registration successful","username":"%s"}`, req.Username)
-}
-
-func listUsersHandler(w http.ResponseWriter, r *http.Request) {
-	if !isAdmin(r) {
-		http.Error(w, "Admin access required", 403)
-		return
-	}
-	mu.RLock()
-	defer mu.RUnlock()
-	type uinfo struct {
-		Username  string `json:"username"`
-		Stars     int    `json:"stars"`
-		Playlists int    `json:"playlists"`
-	}
-	var list []uinfo
-	for _, u := range appDB.Users {
-		pls := 0
-		for _, p := range appDB.Playlists {
-			if p.Owner == u.Username {
-				pls++
-			}
-		}
-		list = append(list, uinfo{Username: u.Username, Stars: len(u.Starred), Playlists: pls})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"users": list})
-}
-
-func deleteUserHandler(w http.ResponseWriter, r *http.Request) {
-	if !isAdmin(r) {
-		http.Error(w, "Admin access required", 403)
-		return
-	}
-	username := strings.TrimSpace(r.URL.Query().Get("username"))
-	adminU, _ := getAdminCreds()
-	if username == "" || username == adminU {
-		http.Error(w, "Cannot delete admin account", 400)
-		return
-	}
-	mu.Lock()
-	delete(appDB.Users, username)
-	mu.Unlock()
-	saveDB()
-
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"status":"ok","deleted":"%s"}`, username)
-}
-
-// -------------------- Admin Login API --------------------
-
-func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		User string `json:"user"`
-		Pass string `json:"pass"`
-	}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	user := strings.TrimSpace(body.User)
-	pass := body.Pass
-	adminUser, adminPass := getAdminCreds()
-
-	ok := false
-	isAdminRole := false
-	if user == adminUser && pass == adminPass {
-		ok = true
-		isAdminRole = true
-	} else {
-		mu.RLock()
-		if u, exists := appDB.Users[user]; exists && u.Password == pass {
-			ok = true
-		}
-		mu.RUnlock()
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if ok {
-		token := fmt.Sprintf("tok_%s_%d", user, time.Now().Unix())
-		fmt.Fprintf(w, `{"ok":true,"token":"%s","user":"%s","isAdmin":%v}`, token, user, isAdminRole)
-	} else {
-		fmt.Fprintf(w, `{"ok":false,"error":"Invalid username or password"}`)
-	}
-}
-
-// -------------------- Lyrics Provider --------------------
-
-func fetchJioLyrics(jioID string) string {
-	cleanID := strings.TrimPrefix(jioID, "js-")
-	apiURL := fmt.Sprintf("%s/lyrics?id=%s", jioAPI, cleanID)
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Get(apiURL)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-
-	var res struct {
-		Status string `json:"status"`
-		Data   struct {
-			Lyrics string `json:"lyrics"`
-		} `json:"data"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&res) == nil && (res.Status == "SUCCESS" || res.Status == "success") {
-		raw := res.Data.Lyrics
-		raw = strings.ReplaceAll(raw, "<br>", "\n")
-		raw = strings.ReplaceAll(raw, "<br/>", "\n")
-		raw = strings.ReplaceAll(raw, "<br />", "\n")
-		return html.UnescapeString(strings.TrimSpace(raw))
-	}
-	return ""
-}
-
-func fetchLyrics(artist, title string) string {
-	clean := title
-	for _, cut := range []string{"(Official Video)", "(Official Audio)", "(Lyrics)", "(Audio)", "[Official Video]", "|", " - Topic", "[Jio]", "[YT]"} {
-		clean = strings.ReplaceAll(clean, cut, "")
-	}
-	clean = strings.TrimSpace(clean)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	q := url.QueryEscape(clean)
-	if artist != "" && artist != "YouTube" && artist != "JioSaavn" {
-		q = url.QueryEscape(artist + " " + clean)
-	}
-	resp, err := client.Get("https://lrclib.net/api/search?q=" + q)
-	if err == nil {
-		defer resp.Body.Close()
-		if resp.StatusCode == 200 {
-			var results []struct {
-				PlainLyrics string `json:"plainLyrics"`
-			}
-			if json.NewDecoder(resp.Body).Decode(&results) == nil && len(results) > 0 && results[0].PlainLyrics != "" {
-				return strings.TrimSpace(results[0].PlainLyrics)
-			}
-		}
-	}
-	return ""
-}
-
-func getLyricsForSong(id string) string {
-	mu.RLock()
-	s, ok := appDB.Songs[id]
-	mu.RUnlock()
-	if !ok {
-		return ""
-	}
-	if s.Lyrics != "" {
-		return s.Lyrics
-	}
-
-	var lyrics string
-	if strings.HasPrefix(id, "js-") {
-		lyrics = fetchJioLyrics(id)
-	}
-	if lyrics == "" {
-		lyrics = fetchLyrics(s.Artist, s.Title)
-	}
-
-	if lyrics != "" {
-		mu.Lock()
-		if song, ok := appDB.Songs[id]; ok {
-			song.Lyrics = lyrics
-			appDB.Songs[id] = song
-		}
-		mu.Unlock()
-		saveDB()
-	}
-	return lyrics
-}
-
-// -------------------- JioSaavn Engine --------------------
-
-const jioAPI = "https://jiosaavn-api-three-ashy.vercel.app"
-
-func decryptJioURL(encrypted string) string {
-	if encrypted == "" {
-		return ""
-	}
-	switch len(encrypted) % 4 {
-	case 2:
-		encrypted += "=="
-	case 3:
-		encrypted += "="
-	}
-	data, err := base64.StdEncoding.DecodeString(encrypted)
-	if err != nil {
-		data, err = base64.URLEncoding.DecodeString(encrypted)
-		if err != nil {
-			return ""
-		}
-	}
-	block, err := des.NewCipher([]byte("38346591"))
-	if err != nil || len(data)%8 != 0 {
-		return ""
-	}
-	decrypted := make([]byte, len(data))
-	for i := 0; i < len(data); i += 8 {
-		block.Decrypt(decrypted[i:i+8], data[i:i+8])
-	}
-	if n := len(decrypted); n > 0 {
-		pad := int(decrypted[n-1])
-		if pad > 0 && pad <= 8 && pad <= n {
-			decrypted = decrypted[:n-pad]
-		}
-	}
-	urlStr := strings.TrimSpace(string(decrypted))
-	urlStr = strings.Replace(urlStr, "_96.mp4", "_320.mp4", 1)
-	urlStr = strings.Replace(urlStr, "_160.mp4", "_320.mp4", 1)
-	return urlStr
-}
-
-func parseJioImage(raw json.RawMessage) string {
-	var str string
-	if err := json.Unmarshal(raw, &str); err == nil && str != "" {
-		return strings.Replace(strings.Replace(str, "150x150", "500x500", 1), "50x50", "500x500", 1)
-	}
-	var arr []struct {
-		Quality string `json:"quality"`
-		URL     string `json:"URL"`
-	}
-	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
-		return arr[len(arr)-1].URL
-	}
-	return ""
-}
-
-func searchJioSaavn(query string, limit int) []Song {
-	if limit <= 0 {
-		limit = 25
-	}
-	apiURL := fmt.Sprintf("%s/search?query=%s&limit=%d", jioAPI, url.QueryEscape(query), limit)
-	client := &http.Client{Timeout: 3500 * time.Millisecond}
-	resp, err := client.Get(apiURL)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Data struct {
-			Results []struct {
-				ID       string          `json:"id"`
-				Title    string          `json:"title"`
-				Subtitle string          `json:"subtitle"`
-				Image    json.RawMessage `json:"image"`
-				MoreInfo struct {
-					Music    string `json:"music"`
-					Duration string `json:"duration"`
-				} `json:"more_info"`
-			} `json:"results"`
-		} `json:"data"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&result) != nil {
-		return nil
-	}
-
-	var songs []Song
-	for i, r := range result.Data.Results {
-		if i >= limit {
-			break
-		}
-		artist := r.MoreInfo.Music
-		if artist == "" {
-			parts := strings.SplitN(r.Subtitle, " - ", 2)
-			if len(parts) > 0 {
-				artist = strings.TrimSpace(parts[0])
-			}
-		}
-		if artist == "" {
-			artist = "JioSaavn"
-		}
-		dur := 180
-		if d, err := strconv.Atoi(r.MoreInfo.Duration); err == nil && d > 0 {
-			dur = d
-		}
-		img := parseJioImage(r.Image)
-
-		cleanTitle := html.UnescapeString(r.Title)
-		songs = append(songs, Song{
-			YTID:     "js-" + r.ID,
-			Title:    cleanTitle + " [Jio]",
-			Artist:   html.UnescapeString(artist),
-			AddedAt:  time.Now().Format(time.RFC3339),
-			Duration: dur,
-			CoverArt: img,
-		})
-	}
-	return songs
-}
-
-func getJioCoverArt(jioID string) string {
-	id := strings.TrimPrefix(jioID, "js-")
-	apiURL := fmt.Sprintf("%s/songs?id=%s", jioAPI, url.QueryEscape(id))
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(apiURL)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Data struct {
-			Songs []struct {
-				Image json.RawMessage `json:"image"`
-			} `json:"songs"`
-		} `json:"data"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&result) == nil && len(result.Data.Songs) > 0 {
-		return parseJioImage(result.Data.Songs[0].Image)
-	}
-	return ""
-}
-
-func getJioStreamURL(jioID string) string {
-	id := strings.TrimPrefix(jioID, "js-")
-	apiURL := fmt.Sprintf("%s/songs?id=%s", jioAPI, url.QueryEscape(id))
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Get(apiURL)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Data struct {
-			Songs []struct {
-				MoreInfo struct {
-					EncryptedMediaURL string `json:"encrypted_media_url"`
-					Vlink             string `json:"vlink"`
-				} `json:"more_info"`
-			} `json:"songs"`
-		} `json:"data"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&result) != nil || len(result.Data.Songs) == 0 {
-		return ""
-	}
-	mi := result.Data.Songs[0].MoreInfo
-	if u := decryptJioURL(mi.EncryptedMediaURL); u != "" {
-		return u
-	}
-	return mi.Vlink
-}
-
-func ensureSongInMemory(s Song) {
-	mu.Lock()
-	defer mu.Unlock()
-	if _, exists := appDB.Songs[s.YTID]; !exists {
-		appDB.Songs[s.YTID] = s
-	}
-}
-
-// -------------------- Health Handler --------------------
-
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	c := len(appDB.Songs)
-	pc := len(appDB.Playlists)
-	uc := len(appDB.Users)
-	mu.RUnlock()
-	cookies := len(getCookiesArg()) > 0
-	admin, _ := getAdminCreds()
-
-	fid := latestFileID
-	if fid == "" {
-		fid = strings.TrimSpace(os.Getenv("DB_JSON_FILE_ID"))
-	}
-	if fid == "" {
-		fid = "Not configured"
-	}
-
-	hasAPIKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")) != ""
-
-	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v29-smartstream | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
-}
-
-// -------------------- Global CORS Middleware --------------------
-
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// -------------------- App Launcher --------------------
-
-func main() {
-	loadDB()
-	startTempCleaner()
-	startBackgroundSync()
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8000"
-	}
-
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/rest/", subsonicHandler)
-
-	mux.HandleFunc("/", healthHandler)
-	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/list", listHandler)
-	mux.HandleFunc("/db", dbHandler)
-	mux.HandleFunc("/play", playHandler)
-	mux.HandleFunc("/convert", playHandler)
-	mux.HandleFunc("/import/youtube-playlist", importPlaylistHandler)
-	mux.HandleFunc("/import/playlist", importPlaylistHandler)
-	mux.HandleFunc("/playlists/my", myPlaylistsHandler)
-	mux.HandleFunc("/playlists/sync", syncSpecificPlaylistHandler)
-	mux.HandleFunc("/favorites/my", myFavoritesHandler)
-	mux.HandleFunc("/admin/login", adminLoginHandler)
-	mux.HandleFunc("/users/register", registerUserHandler)
-	mux.HandleFunc("/users/create", registerUserHandler)
-	mux.HandleFunc("/users/list", listUsersHandler)
-	mux.HandleFunc("/users/delete", deleteUserHandler)
-
-	adminUser, _ := getAdminCreds()
-	log.Printf("[Server] Initialized on 0.0.0.0:%s | Admin User: %s", port, adminUser)
-	log.Fatal(http.ListenAndServe("0.0.0.0:"+port, corsMiddleware(mux)))
+	port:=cfg.Port
+	if !strings.HasPrefix(port,":"){ port=":"+port }
+	log.Printf("Starting FINAL TG-CACHE v3.0 on %s users=%d songs=%d cached=%d",port,len(usersMap),len(db.Songs),countCached())
+	log.Fatal(http.ListenAndServe(port,mux))
 }
