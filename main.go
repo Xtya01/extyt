@@ -87,7 +87,7 @@ var (
 	hasCookies   bool
 	latestFileID string
 	searchCache  sync.Map
-	sem          = make(chan struct{}, 2) // Increased from 1 to 2
+	sem          = make(chan struct{}, 2)
 	lastBackup   time.Time
 )
 
@@ -247,7 +247,6 @@ func backupDBToTelegram() {
 	}
 	defer backupLock.Unlock()
 
-	// Rate limit: minimum 45 seconds between backups
 	if time.Since(lastBackup) < 45*time.Second {
 		return
 	}
@@ -640,7 +639,7 @@ func setCachedSearch(query string, songs []Song) {
 	})
 }
 
-// -------------------- YouTube Engine (Search & Exact Duration) --------------------
+// -------------------- YouTube Engine --------------------
 
 func searchYouTubeAPI(query string, maxResults int, apiKey string) []Song {
 	searchURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=%d&q=%s&key=%s",
@@ -1807,18 +1806,17 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		ytArgs = append(ytArgs, cookieArgs...)
 	}
 
-	// Improved format + clients
 	ytArgs = append(ytArgs,
-		"-f", "bestaudio[ext=m4a]/bestaudio/best",
+		"-f", "bestaudio/best",
 		"-x", "--audio-format", "m4a",
 		"--audio-quality", "0",
 		"--no-playlist",
 		"--no-check-certificate",
 		"--no-warnings",
 		"--geo-bypass",
-		"--socket-timeout", "20",
+		"--socket-timeout", "25",
 		"--retries", "3",
-		"--extractor-args", "youtube:player_client=android,web,mweb,ios",
+		"--extractor-args", "youtube:player_client=android,ios,web,mweb,tv",
 		"-o", outputTemplate,
 		"https://www.youtube.com/watch?v="+ytID,
 	)
@@ -1952,7 +1950,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		"--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s",
 		"--no-download",
 		"--playlist-end", fmt.Sprintf("%d", maxVideos),
-		"--extractor-args", "youtube:player_client=android,web,mweb,ios",
+		"--extractor-args", "youtube:player_client=android,ios,web,mweb,tv",
 		playlistURL,
 	)
 
@@ -2359,7 +2357,7 @@ func adminLoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// -------------------- Lyrics Provider (JioSaavn + LRCLib) --------------------
+// -------------------- Lyrics Provider --------------------
 
 func fetchJioLyrics(jioID string) string {
 	cleanID := strings.TrimPrefix(jioID, "js-")
@@ -2680,10 +2678,8 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Subsonic endpoints
 	mux.HandleFunc("/rest/", subsonicHandler)
 
-	// Admin, Auth & Utility routes
 	mux.HandleFunc("/", healthHandler)
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/list", listHandler)
