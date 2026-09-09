@@ -23,7 +23,6 @@ import (
 	"time"
 )
 
-// ENV compat - supports both naming conventions
 func getEnvAny(keys []string, def string) string {
 	for _, k := range keys {
 		if v := os.Getenv(k); v != "" {
@@ -64,7 +63,6 @@ var usersMap=map[string]string{}
 var muUsers sync.RWMutex
 
 func getCookiesContent() string{
-	// Try B64 first
 	if b64 := getEnvAny([]string{"YT_COOKIES_B64","YOUTUBE_COOKIES_B64"}, ""); strings.TrimSpace(b64) != "" {
 		trimmed := strings.TrimSpace(b64)
 		if d, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
@@ -72,7 +70,6 @@ func getCookiesContent() string{
 			if strings.Contains(s, "Netscape") || strings.Contains(s, "youtube.com") {
 				return s
 			}
-			// If decoded doesn't look like cookies, maybe it's already decoded but base64 encoded twice? Return decoded anyway
 			if len(s) > 100 {
 				return s
 			}
@@ -86,11 +83,9 @@ func getCookiesContent() string{
 				return s
 			}
 		}
-		// If not base64 or already is cookie file, return as is if it looks like cookie
 		if strings.Contains(trimmed, "Netscape") {
 			return trimmed
 		}
-		// Try url decode?
 		return trimmed
 	}
 	raw := getEnvAny([]string{"YT_COOKIES","YOUTUBE_COOKIES"}, "")
@@ -128,7 +123,6 @@ func initUsers(){
 			if _,ok:=usersMap[u];!ok{usersMap[u]=pw}
 		}
 	}
-	log.Printf("USERS: %d loaded", len(usersMap))
 }
 
 type Song struct{ID string `json:"id"`; Title string `json:"title"`; Artist string `json:"artist"`; ArtistID string `json:"artistId"`; Album string `json:"album"`; AlbumID string `json:"albumId"`; Duration int `json:"duration"`; CoverArt string `json:"coverArt"`; Year int `json:"year"`; Genre string `json:"genre"`; Source string `json:"source"`; SourceID string `json:"sourceId"`; StreamURL string `json:"streamUrl,omitempty"`; ThumbURL string `json:"thumbUrl"`; PlayCount int `json:"playCount"`; TgFileID string `json:"tgFileId,omitempty"`; TgFileUniqueID string `json:"tgFileUniqueId,omitempty"`; CachedAt string `json:"cachedAt,omitempty"`}
@@ -141,7 +135,7 @@ var streamCache sync.Map
 type cachedURL struct{URL string; Expiry time.Time}
 var ytSem=make(chan struct{},2)
 var tgCacheInProgress sync.Map
-var httpClient=&http.Client{Timeout: 15*time.Second}
+var httpClient=&http.Client{Timeout: 8*time.Second}
 
 type ConnStatus struct{
 	TG struct{Connected bool; Working bool; Error string; BotName string; ChatID string} `json:"tg"`
@@ -153,16 +147,65 @@ var connCache = ConnStatus{}
 var connCacheTime time.Time
 var connMu sync.RWMutex
 
-func checkConnections() ConnStatus{
+// Fast non-blocking connections check - returns cached immediately, refreshes in background
+func getConnectionsFast() ConnStatus {
 	connMu.RLock()
-	if time.Since(connCacheTime) < 15*time.Second {
-		c := connCache
-		connMu.RUnlock()
-		return c
-	}
+	cached := connCache
+	age := time.Since(connCacheTime)
 	connMu.RUnlock()
+	
+	// If cache is fresh (<30s) or empty but we have some data, return it immediately
+	if age < 30*time.Second && connCacheTime.Unix() != 0 {
+		return cached
+	}
+	// If cache is stale, trigger background refresh and return stale cache for fast response
+	if connCacheTime.Unix() != 0 {
+		go func() {
+			checkConnectionsReal()
+		}()
+		return cached
+	}
+	// First time - do quick check without heavy external calls
+	return checkConnectionsQuick()
+}
+
+func checkConnectionsQuick() ConnStatus {
 	var status ConnStatus
-	// TG check
+	// Quick checks without external API calls - just env presence
+	status.TG.Connected = cfg.TelegramToken != ""
+	status.TG.ChatID = cfg.TelegramChatID
+	status.TG.Working = cfg.TelegramToken != "" // Assume working if token present, detailed check in background
+	if cfg.TelegramToken != "" {
+		status.TG.BotName = "Checking..."
+	}
+	
+	status.YT.Connected = cfg.YtApiKey != ""
+	status.YT.HasKey = cfg.YtApiKey != ""
+	status.YT.Working = cfg.YtApiKey != "" // Assume working
+	
+	cc := getCookiesContent()
+	if cc != "" {
+		status.YT.HasCookies = true
+		status.Cookies.Exists = true
+		status.Cookies.Size = len(cc)
+		status.Cookies.Valid = true
+	}
+	
+	status.Jio.Connected = cfg.JioApiUrl != ""
+	status.Jio.ApiUrl = cfg.JioApiUrl
+	status.Jio.Working = true
+	
+	cmd := exec.Command("yt-dlp", "--version")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		status.YT.YtdlpVersion = strings.TrimSpace(string(out))
+	}
+	
+	return status
+}
+
+func checkConnectionsReal() ConnStatus {
+	var status ConnStatus
 	if cfg.TelegramToken != "" {
 		status.TG.Connected = true
 		status.TG.ChatID = cfg.TelegramChatID
@@ -185,9 +228,8 @@ func checkConnections() ConnStatus{
 		}
 	} else {
 		status.TG.Connected = false
-		status.TG.Error = "BOT_TOKEN / TELEGRAM_BOT_TOKEN not set"
+		status.TG.Error = "BOT_TOKEN not set"
 	}
-	// YT check
 	if cfg.YtApiKey != "" {
 		status.YT.HasKey = true
 		status.YT.Connected = true
@@ -246,10 +288,15 @@ func checkConnections() ConnStatus{
 	connMu.Unlock()
 	return status
 }
+
+func checkConnections() ConnStatus {
+	// For detailed check endpoint, do real check
+	return checkConnectionsReal()
+}
+
 func min(a,b int)int{ if a<b{return a}; return b }
 func (d *DB) save() error{
 	d.RLock(); defer d.RUnlock()
-	// Ensure dir exists
 	dir := filepath.Dir(cfg.DbPath)
 	os.MkdirAll(dir, 0755)
 	b,_:=json.MarshalIndent(d,"","  ")
@@ -259,7 +306,6 @@ func (d *DB) save() error{
 }
 func (d *DB) load() error{
 	if _,err:=os.Stat(cfg.DbPath); err!=nil{
-		// Try alternative path
 		if _, err2 := os.Stat("db.json"); err2 == nil {
 			cfg.DbPath = "db.json"
 		} else {
@@ -313,7 +359,6 @@ func telegramDownloadDB() error{
 	resp2,_:=httpClient.Get(down)
 	defer resp2.Body.Close()
 	b,_:=io.ReadAll(resp2.Body)
-	// Ensure dir
 	os.MkdirAll(filepath.Dir(cfg.DbPath),0755)
 	return os.WriteFile(cfg.DbPath,b,0644)
 }
@@ -450,7 +495,7 @@ func writeJSON(w http.ResponseWriter,s int,p interface{}){
 	json.NewEncoder(w).Encode(p)
 }
 func subOK(d map[string]interface{})map[string]interface{}{
-	b:=map[string]interface{}{"status":"ok","version":"1.16.1","type":"go-compat","serverVersion":"4.3-compat-env","openSubsonic":true}
+	b:=map[string]interface{}{"status":"ok","version":"1.16.1","type":"go-robust","serverVersion":"4.4-robust-fast","openSubsonic":true}
 	for k,v:=range d{b[k]=v}
 	return map[string]interface{}{"subsonic-response":b}
 }
@@ -733,8 +778,7 @@ func handleConnections(w http.ResponseWriter,r *http.Request){
 			"hasFileId": cfg.TelegramFileID != "",
 			"hasCookies": getCookiesContent() != "",
 			"cookiesSize": len(getCookiesContent()),
-			"cookiesValid": getCookiesContent() != "" && (strings.Contains(getCookiesContent(), "youtube") || strings.Contains(getCookiesContent(), "Netscape")),
-			"compat": "Supports BOT_TOKEN/CHANNEL_ID/DB_JSON_FILE_ID and TELEGRAM_ prefix both",
+			"compat": "FAST HEALTH - no blocking",
 		},
 	})
 }
@@ -783,10 +827,9 @@ func handleTgIndex(w http.ResponseWriter,r *http.Request){
 func handleEndpoints(w http.ResponseWriter,r *http.Request){
 	if ok,_:=checkAuth(r); !ok{writeJSON(w,200,subFail("auth",40)); return}
 	endpoints := []map[string]interface{}{
-		{"path": "/rest/ping.view", "method": "GET", "desc": "Ping"},
-		{"path": "/rest/getConnections.view", "method": "GET", "desc": "ENV compat check - supports BOT_TOKEN and TELEGRAM_BOT_TOKEN both"},
-		{"path": "/rest/debugEnv.view", "method": "GET", "desc": "Debug env"},
-		{"path": "/health", "method": "GET", "desc": "Health + compat"},
+		{"path": "/rest/ping.view", "method": "GET", "desc": "Ping - fast"},
+		{"path": "/health", "method": "GET", "desc": "FAST health - no blocking, instant"},
+		{"path": "/rest/getConnections.view", "method": "GET", "desc": "Full check with external API calls"},
 	}
 	respond(w,r,map[string]interface{}{"endpoints": endpoints})
 }
@@ -808,40 +851,40 @@ func handleDebugEnv(w http.ResponseWriter,r *http.Request){
 			}
 		}
 	}
-	respond(w,r,map[string]interface{}{"debugEnv": envMap, "connections": checkConnections(), "compatInfo": "This build supports BOT_TOKEN, CHANNEL_ID, DB_JSON_FILE_ID and TELEGRAM_BOT_TOKEN etc both"})
+	respond(w,r,map[string]interface{}{"debugEnv": envMap, "connections": getConnectionsFast()})
 }
 
 func main(){
 	cfg=loadConfig()
-	log.Println("=== KOYEB ENV COMPAT DEBUG ===")
-	log.Printf("BOT_TOKEN/TELEGRAM_BOT_TOKEN present: %v len=%d", cfg.TelegramToken != "", len(cfg.TelegramToken))
-	log.Printf("CHANNEL_ID/TELEGRAM_CHAT_ID present: %v len=%d val=%s", cfg.TelegramChatID != "", len(cfg.TelegramChatID), cfg.TelegramChatID)
-	log.Printf("DB_JSON_FILE_ID/TELEGRAM_DB_FILE_ID present: %v len=%d", cfg.TelegramFileID != "", len(cfg.TelegramFileID))
+	log.Println("=== KOYEB FAST HEALTH v4.4 ===")
+	log.Printf("BOT_TOKEN present: %v len=%d", cfg.TelegramToken != "", len(cfg.TelegramToken))
+	log.Printf("CHANNEL_ID present: %v val=%s", cfg.TelegramChatID != "", cfg.TelegramChatID)
 	log.Printf("YT_API_KEY present: %v len=%d", cfg.YtApiKey != "", len(cfg.YtApiKey))
-	log.Printf("YT_COOKIES_B64 present: %v len=%d", getEnvAny([]string{"YT_COOKIES_B64"}, "") != "", len(getEnvAny([]string{"YT_COOKIES_B64"}, "")))
-	log.Printf("Cookies content size: %d valid=%v", len(getCookiesContent()), len(getCookiesContent())>100)
-	log.Printf("SUBSONIC_USER: %s USERS: %s", cfg.SubUser, cfg.SubUsersRaw)
-	log.Printf("DB_PATH: %s", cfg.DbPath)
-	log.Println("=== COMPAT: Supports both BOT_TOKEN and TELEGRAM_BOT_TOKEN ===")
+	log.Printf("Cookies size: %d", len(getCookiesContent()))
 
 	db.load()
 	if len(db.Songs)==0&&cfg.TelegramFileID!=""{
-		log.Println("Attempting to download DB from Telegram...")
+		log.Println("Downloading DB from Telegram...")
 		if err:=telegramDownloadDB(); err!=nil{
 			log.Printf("DB download failed: %v", err)
 		} else {
 			db.load()
-			log.Printf("DB downloaded, songs: %d", len(db.Songs))
+			log.Printf("DB restored songs: %d", len(db.Songs))
 		}
 	}
 	os.MkdirAll(filepath.Dir(cfg.DbPath),0755)
 	initUsers()
 	if cc:=getCookiesContent(); cc!=""{
 		os.WriteFile("/tmp/cookies.txt",[]byte(cc),0600)
-		log.Printf("Cookies written %d bytes", len(cc))
-	} else {
-		log.Println("WARNING: No cookies")
 	}
+
+	// Pre-warm connections cache in background
+	go func() {
+		time.Sleep(2*time.Second)
+		checkConnectionsReal()
+		log.Println("Background connections check done")
+	}()
+
 	mux:=http.NewServeMux()
 	mux.HandleFunc("/rest/ping.view",handlePing)
 	mux.HandleFunc("/rest/getLicense.view",handleLicense)
@@ -877,32 +920,43 @@ func main(){
 	mux.HandleFunc("/rest/debugEnv.view",handleDebugEnv)
 	mux.HandleFunc("/health",func(w http.ResponseWriter,r *http.Request){
 		w.Header().Set("Access-Control-Allow-Origin","*")
+		// FAST PATH - don't block on external API calls
 		cached:=0
 		db.RLock()
 		for _,s:=range db.Songs{if s.TgFileID!=""{cached++}}
+		songsCount := len(db.Songs)
+		plsCount := len(db.Playlists)
+		usersCount := len(usersMap)
 		db.RUnlock()
-		status:=checkConnections()
+		
+		status := getConnectionsFast()
+		
 		writeJSON(w,200,map[string]interface{}{
-			"status":"ok","songs":len(db.Songs),"playlists":len(db.Playlists),"users":len(usersMap),"cached":cached,
+			"status":"ok",
+			"songs":songsCount,
+			"playlists":plsCount,
+			"users":usersCount,
+			"cached":cached,
 			"connections":status,
 			"env": map[string]interface{}{
-				"compat": "BOT_TOKEN/CHANNEL_ID/DB_JSON_FILE_ID supported",
-				"hasYtKey": cfg.YtApiKey!="", "ytKeyLen": len(cfg.YtApiKey),
-				"hasTgToken": cfg.TelegramToken!="", "hasChatId": cfg.TelegramChatID!="", "chatId": cfg.TelegramChatID,
-				"hasFileId": cfg.TelegramFileID!="",
-				"hasCookies": getCookiesContent()!="", "cookiesSize": len(getCookiesContent()),
+				"fastHealth": true,
+				"hasYtKey": cfg.YtApiKey!="",
+				"hasTgToken": cfg.TelegramToken!="",
+				"hasCookies": getCookiesContent()!="",
+				"cookiesSize": len(getCookiesContent()),
 			},
+			"timestamp": time.Now().Format(time.RFC3339),
 		})
 	})
 	mux.HandleFunc("/",func(w http.ResponseWriter,r *http.Request){
 		w.Header().Set("Content-Type","text/html")
 		w.Header().Set("Access-Control-Allow-Origin","*")
 		if r.URL.Path!="/"{http.NotFound(w,r); return}
-		fmt.Fprint(w, "<html><body style='background:#000;color:#fff;font-family:monospace;padding:20px'><h2>Koyeb API v4.3 COMPAT ENV</h2><p>Supports both BOT_TOKEN and TELEGRAM_BOT_TOKEN</p><p>Supports both CHANNEL_ID and TELEGRAM_CHAT_ID</p><p>Supports both DB_JSON_FILE_ID and TELEGRAM_DB_FILE_ID</p><p>UI: https://novastream.urp.pp.ua</p><p>Health: /health</p><p>Debug: /rest/debugEnv.view?u=admin&p=admin2330</p></body></html>")
+		fmt.Fprint(w, "<html><body style='background:#000;color:#fff;font-family:monospace;padding:20px'><h2>Koyeb API v4.4 FAST</h2><p>Fast health - instant load for Worker</p><p>UI: https://novastream.urp.pp.ua</p></body></html>")
 	})
 	go func(){ticker:=time.NewTicker(5*time.Minute); for range ticker.C{db.save(); go telegramUploadDB()}}()
 	port:=cfg.Port
 	if !strings.HasPrefix(port,":"){port=":"+port}
-	log.Printf("Starting COMPAT v4.3 on %s - Supports BOT_TOKEN etc",port)
+	log.Printf("Starting FAST v4.4 on %s",port)
 	log.Fatal(http.ListenAndServe(port,corsMiddleware(mux)))
 }
