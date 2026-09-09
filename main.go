@@ -160,7 +160,7 @@ func checkAuth(r *http.Request)(bool,string){
 	return false,""
 }
 func writeJSON(w http.ResponseWriter,s int,p interface{}){w.Header().Set("Content-Type","application/json"); w.WriteHeader(s); json.NewEncoder(w).Encode(p)}
-func subOK(d map[string]interface{})map[string]interface{}{b:=map[string]interface{}{"status":"ok","version":"1.16.1","type":"go-jio-yt-tgcache-b64","serverVersion":"3.1-b64cookies-fixed","openSubsonic":true}; for k,v:=range d{b[k]=v}; return map[string]interface{}{"subsonic-response":b}}
+func subOK(d map[string]interface{})map[string]interface{}{b:=map[string]interface{}{"status":"ok","version":"1.16.1","type":"go-jio-yt-tgcache-b64","serverVersion":"3.1-b64-final-full-ui","openSubsonic":true}; for k,v:=range d{b[k]=v}; return map[string]interface{}{"subsonic-response":b}}
 func subFail(m string,c int)map[string]interface{}{return map[string]interface{}{"subsonic-response":map[string]interface{}{"status":"failed","version":"1.16.1","error":map[string]interface{}{"code":c,"message":m}}}}
 func respond(w http.ResponseWriter,r *http.Request,d map[string]interface{}){writeJSON(w,200,subOK(d))}
 func slugArtist(n string)string{return "ar_"+url.PathEscape(strings.ToLower(strings.ReplaceAll(strings.TrimSpace(n)," ","_")))}
@@ -266,7 +266,83 @@ func handleGetStarred(w http.ResponseWriter,r *http.Request){ok,user:=checkAuth(
 func handleGetStarred2(w http.ResponseWriter,r *http.Request){handleGetStarred(w,r)}
 func handleScrobble(w http.ResponseWriter,r *http.Request){id:=r.URL.Query().Get("id"); if id!=""{db.Lock(); if s,ok:=db.Songs[id]; ok{s.PlayCount++}; db.Unlock()}; respond(w,r,map[string]interface{}{})}
 func handleScanStatus(w http.ResponseWriter,r *http.Request){respond(w,r,map[string]interface{}{"scanStatus":map[string]interface{}{"scanning":false,"count":len(db.Songs)}})}
-const adminHTML = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Fixed</title></head><body>Fixed Build v3.1 - Base64 Cookies + TG Cache - Error Fixed: user declared and not used</body></html>`
+
+const adminHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Subsonic v3.1 Full UI</title><script src="https://cdn.tailwindcss.com"></script><style>.mono{font-family:ui-monospace,Menlo,monospace}</style></head><body class="bg-[#0a0a0a] text-zinc-100 min-h-screen"><div class="max-w-6xl mx-auto p-4 sm:p-6">
+<div class="flex flex-wrap items-center justify-between gap-3 border border-zinc-800 rounded-2xl p-4 bg-zinc-900/40">
+<div><div class="text-xl font-bold">🎵 Subsonic v3.1 Full UI - B64 Cookies + TG Cache</div><div class="text-xs text-zinc-500 mono">Base64 cookies • 1st play TG cache • Album Art • Offline • Favourite</div></div>
+<div class="flex gap-2 flex-wrap">
+<input id="srv" placeholder="https://app.koyeb.app" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm w-56 mono">
+<input id="au" value="admin" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm w-24">
+<input id="ap" type="password" value="admin" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm w-24">
+<button onclick="saveCred()" class="bg-lime-400 text-black px-4 py-2 rounded-lg text-sm font-bold">Save</button>
+</div></div>
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
+<div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4"><div class="text-xs text-zinc-500 mono">SONGS</div><div id="statSongs" class="text-2xl font-bold">-</div></div>
+<div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4"><div class="text-xs text-zinc-500 mono">TG CACHED</div><div id="statCached" class="text-2xl font-bold text-lime-400">-</div></div>
+<div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4"><div class="text-xs text-zinc-500 mono">PLAYLISTS</div><div id="statPls" class="text-2xl font-bold">-</div></div>
+<div class="bg-zinc-900 border border-zinc-800 rounded-xl p-4"><div class="text-xs text-zinc-500 mono">USERS</div><div id="statUsers" class="text-2xl font-bold">-</div></div>
+</div>
+<div class="mt-5 grid md:grid-cols-2 gap-4">
+<div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+<div class="font-semibold">🍪 Base64 Cookies</div>
+<div class="text-xs text-zinc-400 mt-2 leading-relaxed">1. Get cookies.txt via extension<br>2. <span class="mono text-lime-300">base64 -w 0 cookies.txt</span><br>3. Env: <span class="mono text-white">YT_COOKIES_B64=PASTE</span><br>Log: <span class="mono text-lime-300">Using YT_COOKIES_B64 std XXXX bytes</span></div>
+<div class="font-semibold mt-4">▶️ YT Import + TG Cache</div>
+<input id="yturl" placeholder="https://www.youtube.com/playlist?list=PL..." class="mt-3 w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2.5 text-sm mono">
+<button onclick="importYT()" class="mt-3 bg-white text-black px-4 py-2 rounded-lg text-sm font-bold w-full">Import as Me (TG Cache ON)</button>
+<div id="ytRes" class="mt-3 text-xs mono bg-black border border-zinc-800 rounded-lg p-2 max-h-32 overflow-auto"></div>
+</div>
+<div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+<div class="font-semibold">👤 Users & Self Playlist</div>
+<div class="flex gap-2 mt-3">
+<input id="nu" placeholder="new username" class="flex-1 bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm">
+<input id="np" placeholder="password" class="flex-1 bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm">
+</div>
+<button onclick="createUser()" class="mt-3 bg-lime-400 text-black px-4 py-2 rounded-lg text-sm font-bold w-full">Create User (Admin Only)</button>
+<div id="userRes" class="mt-2 text-xs mono"></div>
+<div class="mt-4 flex gap-2">
+<button onclick="loadPlaylists()" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded-lg text-xs w-full">Refresh Playlists</button>
+<button onclick="loadStarred()" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded-lg text-xs w-full">My Favourites ⭐</button>
+</div>
+<div class="mt-3 bg-black rounded-lg p-3 border border-zinc-800 text-xs mono">Server: <span id="curSrv" class="text-lime-300">https://app.koyeb.app</span>/rest<br>User: <span id="curU">admin</span><br>Type: Subsonic - Self playlist + Admin sees all</div>
+</div>
+</div>
+<div class="mt-4 grid md:grid-cols-2 gap-4">
+<div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+<div class="font-semibold">📀 Playlists (Self + Admin + Cached Count)</div>
+<div id="pls" class="mt-3 space-y-2 max-h-96 overflow-auto"></div>
+</div>
+<div class="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+<div class="font-semibold">⭐ Favourites & Offline</div>
+<div id="starred" class="mt-3 space-y-2 max-h-96 overflow-auto text-sm"></div>
+<div class="mt-3 text-[11px] text-zinc-500">Offline: <span class="mono">/rest/download.view?id=xxx</span> works in AmcFy</div>
+</div>
+</div>
+<div class="mt-4 bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+<div class="font-semibold">🔧 API Tester</div>
+<div class="flex flex-wrap gap-2 mt-3">
+<button onclick="test('ping')" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded-lg text-xs mono">ping</button>
+<button onclick="test('playlists')" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded-lg text-xs mono">getPlaylists</button>
+<button onclick="test('starred')" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded-lg text-xs mono">getStarred</button>
+<button onclick="test('health')" class="bg-zinc-800 border border-zinc-700 px-3 py-2 rounded-lg text-xs mono">/health</button>
+</div>
+<pre id="apiRes" class="mt-3 bg-black border border-zinc-800 rounded-lg p-3 text-xs mono overflow-auto max-h-64"></pre>
+</div>
+</div>
+<script>
+function getBase(){return (document.getElementById('srv').value||'').replace(/\/+$/,'')||location.origin}
+function getCred(){return {u:document.getElementById('au').value||'admin',p:document.getElementById('ap').value||'admin'}}
+function saveCred(){localStorage.setItem('sub_srv',document.getElementById('srv').value);localStorage.setItem('sub_u',document.getElementById('au').value);localStorage.setItem('sub_p',document.getElementById('ap').value);document.getElementById('curSrv').textContent=getBase();document.getElementById('curU').textContent=getCred().u;toast('Saved');loadStats()}
+function toast(m){let d=document.createElement('div');d.textContent=m;d.className='fixed bottom-4 right-4 bg-zinc-800 border border-zinc-700 text-white px-4 py-2 rounded-lg text-sm';document.body.appendChild(d);setTimeout(()=>d.remove(),2000)}
+async function loadStats(){try{let b=getBase();let r=await fetch(b+'/health');let j=await r.json();document.getElementById('statSongs').textContent=j.songs||0;document.getElementById('statPls').textContent=j.playlists||0;document.getElementById('statUsers').textContent=j.users||0;document.getElementById('statCached').textContent=j.cached||0;}catch{}}
+async function importYT(){let url=document.getElementById('yturl').value.trim();if(!url)return toast('Paste YT URL');let {u,p}=getCred();let base=getBase();document.getElementById('ytRes').textContent='Importing as '+u+'...';try{let api=base+'/rest/importYoutubePlaylist.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json&url='+encodeURIComponent(url);let r=await fetch(api);let j=await r.json();document.getElementById('ytRes').textContent=JSON.stringify(j,null,2);toast('Imported');loadStats();loadPlaylists();}catch(e){document.getElementById('ytRes').textContent='Error:'+e}}
+async function createUser(){let nu=document.getElementById('nu').value.trim();let np=document.getElementById('np').value.trim();if(!nu||!np)return toast('username/pass');let {u,p}=getCred();let base=getBase();try{let api=base+'/rest/createUser.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json&username='+encodeURIComponent(nu)+'&password='+encodeURIComponent(np);let r=await fetch(api);let j=await r.json();document.getElementById('userRes').textContent=JSON.stringify(j,null,2);toast('User '+nu);}catch(e){document.getElementById('userRes').textContent='Error:'+e}}
+async function loadPlaylists(){let {u,p}=getCred();let base=getBase();try{let api=base+'/rest/getPlaylists.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json';let r=await fetch(api);let j=await r.json();let list=j['subsonic-response']?.playlists?.playlist||[];if(!Array.isArray(list))list=[list];let html=list.map(pl=>'<div class="bg-black border border-zinc-800 rounded-lg p-3 flex justify-between"><div><div class="font-medium">'+pl.name+'</div><div class="text-xs text-zinc-500 mono">'+pl.owner+' • '+pl.songCount+' • cached '+(pl.cachedCount||0)+'</div></div><div class="flex gap-1"><button onclick="viewPl(\''+pl.id+'\')" class="bg-zinc-800 px-2 py-1 rounded text-xs">View</button></div></div>').join('');document.getElementById('pls').innerHTML=html||'No playlists';}catch(e){document.getElementById('pls').textContent='Error:'+e}}
+async function viewPl(id){let {u,p}=getCred();let base=getBase();let api=base+'/rest/getPlaylist.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json&id='+id;let r=await fetch(api);let j=await r.json();document.getElementById('apiRes').textContent=JSON.stringify(j,null,2)}
+async function loadStarred(){let {u,p}=getCred();let base=getBase();try{let api=base+'/rest/getStarred.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json';let r=await fetch(api);let j=await r.json();let songs=j['subsonic-response']?.starred?.song||[];if(!Array.isArray(songs))songs=[songs];let html=songs.map(s=>'<div class="bg-black border border-zinc-800 rounded-lg p-2 flex gap-2"><div class="flex-1"><div class="text-sm">'+s.title+'</div><div class="text-xs text-zinc-500">'+s.artist+(s.cached?' • TG cached':'')+'</div></div><a href="'+base+'/rest/download.view?id='+s.id+'&u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy" class="bg-zinc-800 px-2 py-1 rounded text-xs">⬇️</a></div>').join('');document.getElementById('starred').innerHTML=html||'No favourites';}catch(e){document.getElementById('starred').textContent='Error:'+e}}
+async function test(which){let {u,p}=getCred();let base=getBase();let url='';if(which==='ping')url=base+'/rest/ping.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json';if(which==='playlists')url=base+'/rest/getPlaylists.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json';if(which==='starred')url=base+'/rest/getStarred.view?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)+'&v=1.16.1&c=amcfy&f=json';if(which==='health')url=base+'/health';try{let r=await fetch(url);let t=await r.text();document.getElementById('apiRes').textContent=t.slice(0,5000)}catch(e){document.getElementById('apiRes').textContent='Error:'+e}}
+window.addEventListener('DOMContentLoaded',()=>{let s=localStorage.getItem('sub_srv');if(s)document.getElementById('srv').value=s;let su=localStorage.getItem('sub_u');if(su)document.getElementById('au').value=su;let sp=localStorage.getItem('sub_p');if(sp)document.getElementById('ap').value=sp;document.getElementById('curSrv').textContent=getBase();document.getElementById('curU').textContent=getCred().u;loadStats();loadPlaylists();loadStarred();});
+</script></body></html>`
+
 func main(){
 	cfg=loadConfig(); db.load(); if len(db.Songs)==0&&cfg.TelegramFileID!=""{telegramDownloadDB(); db.load()}
 	os.MkdirAll(filepath.Dir(cfg.DbPath),0755); initUsers()
@@ -286,8 +362,8 @@ func main(){
 	mux.HandleFunc("/rest/star.view",handleStar); mux.HandleFunc("/rest/unstar.view",handleUnstar)
 	mux.HandleFunc("/rest/getStarred.view",handleGetStarred); mux.HandleFunc("/rest/getStarred2.view",handleGetStarred2)
 	mux.HandleFunc("/rest/scrobble.view",handleScrobble); mux.HandleFunc("/rest/getScanStatus.view",handleScanStatus)
-	mux.HandleFunc("/health",func(w http.ResponseWriter,r *http.Request){cached:=0; db.RLock(); for _,s:=range db.Songs{if s.TgFileID!=""{cached++}}; db.RUnlock(); writeJSON(w,200,map[string]interface{}{"status":"ok","songs":len(db.Songs),"playlists":len(db.Playlists),"users":len(usersMap),"cached":cached})})
+	mux.HandleFunc("/health",func(w http.ResponseWriter,r *http.Request){cached:=0; db.RLock(); for _,s:=range db.Songs{if s.TgFileID!=""{cached++}}; db.RUnlock(); writeJSON(w,200,map[string]interface{}{"status":"ok","songs":len(db.Songs),"playlists":len(db.Playlists),"users":len(usersMap),"cached":cached,"artists":len(db.Artists),"albums":len(db.Albums)})})
 	mux.HandleFunc("/",func(w http.ResponseWriter,r *http.Request){if r.URL.Path!="/"{http.NotFound(w,r); return}; w.Header().Set("Content-Type","text/html"); fmt.Fprint(w,adminHTML)})
 	go func(){ticker:=time.NewTicker(5*time.Minute); for range ticker.C{db.save(); go telegramUploadDB()}}()
-	port:=cfg.Port; if !strings.HasPrefix(port,":"){port=":"+port}; log.Printf("Starting FIXED v3.1 B64 on %s users=%d songs=%d",port,len(usersMap),len(db.Songs)); log.Fatal(http.ListenAndServe(port,mux))
+	port:=cfg.Port; if !strings.HasPrefix(port,":"){port=":"+port}; log.Printf("Starting FULL UI FIXED v3.1 on %s users=%d songs=%d",port,len(usersMap),len(db.Songs)); log.Fatal(http.ListenAndServe(port,mux))
 }
