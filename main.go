@@ -78,6 +78,8 @@ var (
 	}
 	mu           sync.RWMutex
 	backupLock   sync.Mutex
+	cookieOnce   sync.Once
+	hasCookies   bool
 	latestFileID string
 	searchCache  sync.Map
 	sem          = make(chan struct{}, 1) // Prevents RAM exhaustion on Koyeb Free (512MB)
@@ -346,22 +348,34 @@ func proxyTelegramAudio(w http.ResponseWriter, r *http.Request, token, fp string
 
 // -------------------- Helpers & Cleaner --------------------
 
+func initCookies() {
+	cookieOnce.Do(func() {
+		if b64 := strings.TrimSpace(os.Getenv("YT_COOKIES_B64")); len(b64) > 50 {
+			b64 = strings.ReplaceAll(b64, "\n", "")
+			b64 = strings.ReplaceAll(b64, "\r", "")
+			b64 = strings.ReplaceAll(b64, " ", "")
+			decoded, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				decoded, err = base64.RawStdEncoding.DecodeString(b64)
+			}
+			if err == nil && len(decoded) > 50 {
+				os.WriteFile(cookiePath, decoded, 0644)
+				hasCookies = true
+				log.Println("[Cookies] Loaded successfully from YT_COOKIES_B64")
+				return
+			}
+		}
+		if raw := os.Getenv("YT_COOKIES"); len(raw) > 50 {
+			os.WriteFile(cookiePath, []byte(raw), 0644)
+			hasCookies = true
+			log.Println("[Cookies] Loaded successfully from YT_COOKIES")
+		}
+	})
+}
+
 func getCookiesArg() []string {
-	if b64 := strings.TrimSpace(os.Getenv("YT_COOKIES_B64")); len(b64) > 50 {
-		b64 = strings.ReplaceAll(b64, "\n", "")
-		b64 = strings.ReplaceAll(b64, "\r", "")
-		b64 = strings.ReplaceAll(b64, " ", "")
-		decoded, err := base64.StdEncoding.DecodeString(b64)
-		if err != nil {
-			decoded, err = base64.RawStdEncoding.DecodeString(b64)
-		}
-		if err == nil && len(decoded) > 50 {
-			os.WriteFile(cookiePath, decoded, 0644)
-			return []string{"--cookies", cookiePath}
-		}
-	}
-	if raw := os.Getenv("YT_COOKIES"); len(raw) > 50 {
-		os.WriteFile(cookiePath, []byte(raw), 0644)
+	initCookies()
+	if hasCookies {
 		return []string{"--cookies", cookiePath}
 	}
 	return []string{}
@@ -553,10 +567,10 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-// -------------------- YouTube Engine (Bypasses Datacenter Bot Check) --------------------
+// -------------------- YouTube Engine --------------------
 
 func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
 	args := []string{
@@ -564,7 +578,9 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 		"--no-download",
 		"--no-playlist",
 		"--no-check-certificate",
-		"--extractor-args", "youtube:player_client=android,ios",
+		"--no-warnings",
+		"--geo-bypass",
+		"--extractor-args", "youtube:player_client=android,web",
 	}
 	if len(cookieArgs) > 0 {
 		args = append(cookieArgs, args...)
@@ -600,8 +616,7 @@ func searchYouTube(query string, maxResults int) []Song {
 	if maxResults <= 0 {
 		maxResults = 5
 	}
-	// Fixed: 7-second timeout gives python on Koyeb enough time to scrape
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
 	defer cancel()
 
 	cookieArgs := getCookiesArg()
@@ -612,7 +627,9 @@ func searchYouTube(query string, maxResults int) []Song {
 		"--no-download",
 		"--no-playlist",
 		"--no-check-certificate",
-		"--extractor-args", "youtube:player_client=android,ios",
+		"--no-warnings",
+		"--geo-bypass",
+		"--extractor-args", "youtube:player_client=android,web",
 	}
 	if len(cookieArgs) > 0 {
 		args = append(cookieArgs, args...)
@@ -785,19 +802,21 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 
 	case "getartist":
 		mu.RLock()
-		defer mu.RUnlock()
+		songCount := len(appDB.Songs)
+		mu.RUnlock()
+
 		if f == "json" {
 			writeSubsonicOK(w, f, map[string]interface{}{
 				"artist": map[string]interface{}{
 					"id": "ar-1", "name": "Music", "albumCount": 1,
 					"album": []map[string]interface{}{{
 						"id": "al-1", "name": "Cached Songs", "artist": "Music",
-						"artistId": "ar-1", "songCount": len(appDB.Songs), "coverArt": "al-1",
+						"artistId": "ar-1", "songCount": songCount, "coverArt": "al-1",
 					}},
 				},
 			})
 		} else {
-			writeSubsonicOK(w, f, fmt.Sprintf(`<artist id="ar-1" name="Music" albumCount="1"><album id="al-1" name="Cached Songs" artist="Music" artistId="ar-1" songCount="%d"/></artist>`, len(appDB.Songs)))
+			writeSubsonicOK(w, f, fmt.Sprintf(`<artist id="ar-1" name="Music" albumCount="1"><album id="al-1" name="Cached Songs" artist="Music" artistId="ar-1" songCount="%d"/></artist>`, songCount))
 		}
 
 	case "getalbum", "getmusicdirectory":
@@ -1149,7 +1168,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			writeSubsonicOK(w, f, b.String())
 		}
 
-	// 100% User-Specific Star and Unstar
 	case "star":
 		id := r.URL.Query().Get("id")
 		if id != "" && currentUser != "" {
@@ -1387,7 +1405,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		writeSubsonicOK(w, f, map[string]interface{}{})
 
-	// Clean Lyrics Handlers (Completely Eliminates Raw JSON on Amperfy)
 	case "getlyrics":
 		id := r.URL.Query().Get("id")
 		artist := r.URL.Query().Get("artist")
@@ -1474,7 +1491,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			writeSubsonicOK(w, f, b.String())
 		}
 
-	// Subsonic User Management Endpoints
 	case "getuser":
 		username := r.URL.Query().Get("username")
 		if username == "" {
@@ -1600,6 +1616,11 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		username := strings.TrimSpace(r.URL.Query().Get("username"))
+		adminU, _ := getAdminCreds()
+		if username == "" || username == adminU {
+			http.Error(w, "Cannot delete admin account", 400)
+			return
+		}
 		mu.Lock()
 		delete(appDB.Users, username)
 		mu.Unlock()
@@ -1663,7 +1684,10 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		artist = "YouTube"
 	}
 
-	// Fixed: Best audio fallback + Android client bypasses cloud IP bot block
+	// 90-Second context prevents persistent hangs
+	execCtx, execCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer execCancel()
+
 	var ytArgs []string
 	if len(cookieArgs) > 0 {
 		ytArgs = append(ytArgs, cookieArgs...)
@@ -1674,12 +1698,15 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		"-f", "bestaudio/ba/b",
 		"--no-playlist",
 		"--no-check-certificate",
-		"--extractor-args", "youtube:player_client=android,ios",
-		"-o", tmpFile,
+		"--no-warnings",
+		"--geo-bypass",
+		"--socket-timeout", "15",
+		"--extractor-args", "youtube:player_client=android,web",
+		"-o", filepath.Join("/tmp", "%(id)s.%(ext)s"),
 		ytUrl,
 	)
 
-	cmd := exec.Command("yt-dlp", ytArgs...)
+	cmd := exec.CommandContext(execCtx, "yt-dlp", ytArgs...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		os.Remove(tmpFile)
@@ -1759,14 +1786,14 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 	cookieArgs := getCookiesArg()
 	var args []string
 	if len(cookieArgs) > 0 {
-		args = append(args, cookieArgs...)
+		args = append(cookieArgs, args...)
 	}
 	args = append(args,
 		"--flat-playlist",
 		"--print", "%(id)s|||%(title)s|||%(uploader)s",
 		"--no-download",
 		"--playlist-end", fmt.Sprintf("%d", maxVideos),
-		"--extractor-args", "youtube:player_client=android,ios",
+		"--extractor-args", "youtube:player_client=android,web",
 		playlistURL,
 	)
 
@@ -2301,7 +2328,7 @@ func parseJioImage(raw json.RawMessage) string {
 	}
 	var arr []struct {
 		Quality string `json:"quality"`
-		URL     string `json:"url"`
+		URL     string `json:"URL"`
 	}
 	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
 		return arr[len(arr)-1].URL
@@ -2454,7 +2481,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v22-ytfix | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
+	fmt.Fprintf(w, "OK v23-stable | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
