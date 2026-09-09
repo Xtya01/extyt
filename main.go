@@ -569,49 +569,6 @@ func xmlEscape(s string) string {
 
 // -------------------- YouTube Engine (Search & Title) --------------------
 
-func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-	defer cancel()
-
-	args := []string{
-		"--print", "%(title)s|||%(artist)s|||%(uploader)s",
-		"--no-download",
-		"--no-playlist",
-		"--no-check-certificate",
-		"--no-warnings",
-		"--geo-bypass",
-		"--extractor-args", "youtube:player_client=android,web",
-	}
-	if len(cookieArgs) > 0 {
-		args = append(args, cookieArgs...)
-	}
-	args = append(args, ytUrl)
-
-	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", ""
-	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		l := strings.TrimSpace(lines[i])
-		if l == "" || strings.HasPrefix(l, "WARNING") || strings.HasPrefix(l, "ERROR") {
-			continue
-		}
-		parts := strings.Split(l, "|||")
-		if len(parts) >= 1 {
-			title = strings.TrimSpace(parts[0])
-		}
-		if len(parts) >= 2 && strings.TrimSpace(parts[1]) != "" && strings.TrimSpace(parts[1]) != "NA" {
-			artist = strings.TrimSpace(parts[1])
-		} else if len(parts) >= 3 {
-			artist = strings.TrimSpace(parts[2])
-		}
-		break
-	}
-	return title, artist
-}
-
 func searchYouTubeAPI(query string, maxResults int, apiKey string) []Song {
 	apiURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=%d&q=%s&key=%s",
 		maxResults, url.QueryEscape(query), apiKey)
@@ -738,7 +695,7 @@ func searchYouTube(query string, maxResults int) []Song {
 		}
 	}
 
-	// 2. Fallback: Fast flat playlist yt-dlp scraper
+	// 2. Fallback: Fast flat-playlist yt-dlp scraper
 	return searchYouTubeScraper(query, maxResults)
 }
 
@@ -1721,6 +1678,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	song, exists := appDB.Songs[ytID]
 	mu.RUnlock()
 
+	// 1. Instant stream if Telegram cache exists
 	if exists && song.FileID != "" {
 		token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
 		fp := song.FilePath
@@ -1736,6 +1694,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	sem <- struct{}{}
 	defer func() { <-sem }()
 
+	// 2. Instant stream if cached in local disk (/tmp)
 	tmpFile := filepath.Join("/tmp", ytID+".m4a")
 	if _, err := os.Stat(tmpFile); err == nil {
 		w.Header().Set("Content-Type", "audio/mp4")
@@ -1743,42 +1702,44 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cookieArgs := getCookiesArg()
-	title, artist := getYTTitle(ytUrl, cookieArgs)
+	// Use cached/search title directly to eliminate blocking title scraper delay
+	title := song.Title
 	if title == "" {
 		title = ytID
 	}
+	artist := song.Artist
 	if artist == "" {
 		artist = "YouTube"
 	}
 
-	// 90-second context timeout prevents permanent concurrency freeze
-	execCtx, execCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	cookieArgs := getCookiesArg()
+
+	execCtx, execCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer execCancel()
 
+	// Fast iOS stream bypasses datacenter blocks and downloads in pure m4a
 	var ytArgs []string
 	if len(cookieArgs) > 0 {
 		ytArgs = append(ytArgs, cookieArgs...)
 	}
 	ytArgs = append(ytArgs,
 		"-x", "--audio-format", "m4a",
-		"--audio-quality", "0",
-		"-f", "bestaudio/ba/b",
+		"-f", "ba[ext=m4a]/ba/b",
 		"--no-playlist",
 		"--no-check-certificate",
 		"--no-warnings",
 		"--geo-bypass",
 		"--socket-timeout", "15",
-		"--extractor-args", "youtube:player_client=android,web",
+		"--extractor-args", "youtube:player_client=ios,mweb",
 		"-o", filepath.Join("/tmp", "%(id)s.%(ext)s"),
-		ytUrl,
+		"https://www.youtube.com/watch?v="+ytID,
 	)
 
 	cmd := exec.CommandContext(execCtx, "yt-dlp", ytArgs...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		os.Remove(tmpFile)
-		log.Printf("[YT Stream Error] yt-dlp failed for %s: %v | Log: %s", ytUrl, err, string(out))
+		log.Printf("[YT Stream Error] yt-dlp failed for %s: %v | Log: %s", ytID, err, string(out))
 		http.Error(w, fmt.Sprintf("yt-dlp error: %v\n%s", err, string(out)), 500)
 		return
 	}
@@ -1789,42 +1750,53 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	fileID := ""
 	fp := ""
 
+	// Background non-blocking Telegram backup
 	if token != "" && chatID != "" {
-		if f, err := os.Open(tmpFile); err == nil {
-			body := &bytes.Buffer{}
-			writer := multipart.NewWriter(body)
-			part, _ := writer.CreateFormFile("audio", filepath.Base(tmpFile))
-			io.Copy(part, f)
-			f.Close()
-			writer.WriteField("chat_id", chatID)
-			writer.WriteField("caption", title)
-			writer.Close()
+		go func(tPath, sTitle, sID string) {
+			if f, err := os.Open(tPath); err == nil {
+				defer f.Close()
+				body := &bytes.Buffer{}
+				writer := multipart.NewWriter(body)
+				part, _ := writer.CreateFormFile("audio", filepath.Base(tPath))
+				io.Copy(part, f)
+				writer.WriteField("chat_id", chatID)
+				writer.WriteField("caption", sTitle)
+				writer.Close()
 
-			req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendAudio", token), body)
-			req.Header.Set("Content-Type", writer.FormDataContentType())
-			client := &http.Client{Timeout: 60 * time.Second}
-			if resp, err := client.Do(req); err == nil {
-				defer resp.Body.Close()
-				var res struct {
-					Ok     bool `json:"ok"`
-					Result struct {
-						Audio struct {
-							FileID string `json:"file_id"`
-						} `json:"audio"`
-					} `json:"result"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&res) == nil && res.Ok {
-					fileID = res.Result.Audio.FileID
-					fp = getTelegramFilePath(fileID)
+				req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendAudio", token), body)
+				req.Header.Set("Content-Type", writer.FormDataContentType())
+				client := &http.Client{Timeout: 60 * time.Second}
+				if resp, err := client.Do(req); err == nil {
+					defer resp.Body.Close()
+					var res struct {
+						Ok     bool `json:"ok"`
+						Result struct {
+							Audio struct {
+								FileID string `json:"file_id"`
+							} `json:"audio"`
+						} `json:"result"`
+					}
+					if json.NewDecoder(resp.Body).Decode(&res) == nil && res.Ok {
+						uFileID := res.Result.Audio.FileID
+						uFp := getTelegramFilePath(uFileID)
+						mu.Lock()
+						if s, ok := appDB.Songs[sID]; ok {
+							s.FileID = uFileID
+							s.FilePath = uFp
+							appDB.Songs[sID] = s
+						}
+						mu.Unlock()
+						saveDB()
+					}
 				}
 			}
-		}
+		}(tmpFile, title, ytID)
 	}
 
 	mu.Lock()
 	existing := appDB.Songs[ytID]
 	s := Song{
-		YTID: ytID, Title: title + " [YT]", Artist: artist,
+		YTID: ytID, Title: title, Artist: artist,
 		FileID: fileID, FilePath: fp,
 		AddedAt: existing.AddedAt, PlayCount: existing.PlayCount + 1,
 		LastPlayed: now, Starred: existing.Starred, Rating: existing.Rating,
@@ -1838,6 +1810,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 	saveDB()
 
+	// 3. Deliver audio stream
 	w.Header().Set("Content-Type", "audio/mp4")
 	http.ServeFile(w, r, tmpFile)
 }
@@ -2551,7 +2524,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	hasAPIKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")) != ""
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v24-ytapi | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
+	fmt.Fprintf(w, "OK v25-fastplay | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
