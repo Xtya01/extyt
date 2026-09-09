@@ -88,6 +88,47 @@ var (
 const dbPath = "/tmp/db.json"
 const cookiePath = "/tmp/cookies.txt"
 
+// -------------------- Helpers: Audio & Duration --------------------
+
+func parseISO8601Duration(iso string) int {
+	iso = strings.TrimPrefix(iso, "PT")
+	var hours, minutes, seconds int
+	var curr int
+	for _, ch := range iso {
+		if ch >= '0' && ch <= '9' {
+			curr = curr*10 + int(ch-'0')
+		} else if ch == 'H' {
+			hours = curr
+			curr = 0
+		} else if ch == 'M' {
+			minutes = curr
+			curr = 0
+		} else if ch == 'S' {
+			seconds = curr
+			curr = 0
+		}
+	}
+	res := hours*3600 + minutes*60 + seconds
+	if res <= 0 {
+		return 180
+	}
+	return res
+}
+
+func getAudioDuration(file string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffprobe", "-i", file, "-show_entries", "format=duration", "-v", "quiet", "-of", "csv=p=0")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64); err == nil && f > 0 {
+			return int(f)
+		}
+	}
+	return 0
+}
+
 // -------------------- Database Parser & Telegram Persistence --------------------
 
 func parseDBData(data []byte) (AppDB, bool) {
@@ -555,7 +596,7 @@ func songToMap(s Song, u *User) map[string]interface{} {
 	if lastPlayed != "" {
 		m["played"] = lastPlayed
 	}
-	if s.Duration == 0 {
+	if s.Duration <= 0 {
 		m["duration"] = 180
 	}
 	return m
@@ -570,22 +611,20 @@ func xmlEscape(s string) string {
 // -------------------- YouTube Engine (Search & Title) --------------------
 
 func searchYouTubeAPI(query string, maxResults int, apiKey string) []Song {
-	apiURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=%d&q=%s&key=%s",
+	searchURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=%d&q=%s&key=%s",
 		maxResults, url.QueryEscape(query), apiKey)
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Get(apiURL)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(searchURL)
 	if err != nil {
-		log.Printf("[YT API] Request error: %v", err)
 		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[YT API] Non-200 response: %d", resp.StatusCode)
 		return nil
 	}
 
-	var res struct {
+	var searchRes struct {
 		Items []struct {
 			ID struct {
 				VideoID string `json:"videoId"`
@@ -597,14 +636,45 @@ func searchYouTubeAPI(query string, maxResults int, apiKey string) []Song {
 		} `json:"items"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&searchRes); err != nil || len(searchRes.Items) == 0 {
 		return nil
+	}
+
+	var vIDs []string
+	for _, item := range searchRes.Items {
+		if item.ID.VideoID != "" {
+			vIDs = append(vIDs, item.ID.VideoID)
+		}
+	}
+
+	// Fetch exact video duration using contentDetails
+	durationMap := make(map[string]int)
+	if len(vIDs) > 0 {
+		detailURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=%s&key=%s",
+			strings.Join(vIDs, ","), apiKey)
+		if dResp, err := client.Get(detailURL); err == nil {
+			defer dResp.Body.Close()
+			var dRes struct {
+				Items []struct {
+					ID             string `json:"id"`
+					ContentDetails struct {
+						Duration string `json:"duration"`
+					} `json:"contentDetails"`
+				} `json:"items"`
+			}
+			if json.NewDecoder(dResp.Body).Decode(&dRes) == nil {
+				for _, it := range dRes.Items {
+					durationMap[it.ID] = parseISO8601Duration(it.ContentDetails.Duration)
+				}
+			}
+		}
 	}
 
 	var results []Song
 	now := time.Now().Format(time.RFC3339)
-	for _, item := range res.Items {
-		if item.ID.VideoID == "" {
+	for _, item := range searchRes.Items {
+		id := item.ID.VideoID
+		if id == "" {
 			continue
 		}
 		title := html.UnescapeString(item.Snippet.Title)
@@ -612,13 +682,17 @@ func searchYouTubeAPI(query string, maxResults int, apiKey string) []Song {
 		if artist == "" {
 			artist = "YouTube"
 		}
+		dur := durationMap[id]
+		if dur <= 0 {
+			dur = 180
+		}
 		results = append(results, Song{
-			YTID:     item.ID.VideoID,
+			YTID:     id,
 			Title:    title + " [YT]",
 			Artist:   artist,
 			AddedAt:  now,
-			Duration: 180,
-			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", item.ID.VideoID),
+			Duration: dur,
+			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
 		})
 	}
 	return results
@@ -633,7 +707,7 @@ func searchYouTubeScraper(query string, maxResults int) []Song {
 
 	args := []string{
 		"--flat-playlist",
-		"--print", "%(id)s|||%(title)s|||%(uploader)s",
+		"--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s",
 		"--no-download",
 		"--no-check-certificate",
 		"--no-warnings",
@@ -647,7 +721,6 @@ func searchYouTubeScraper(query string, maxResults int) []Song {
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[YT Scraper] Error: %v | Log: %s", err, string(out))
 		return nil
 	}
 
@@ -658,7 +731,7 @@ func searchYouTubeScraper(query string, maxResults int) []Song {
 		if line == "" || strings.HasPrefix(line, "WARNING") || strings.HasPrefix(line, "ERROR") {
 			continue
 		}
-		parts := strings.SplitN(line, "|||", 3)
+		parts := strings.Split(line, "|||")
 		if len(parts) < 2 {
 			continue
 		}
@@ -668,6 +741,12 @@ func searchYouTubeScraper(query string, maxResults int) []Song {
 		if len(parts) >= 3 && strings.TrimSpace(parts[2]) != "" {
 			artist = strings.TrimSpace(parts[2])
 		}
+		dur := 180
+		if len(parts) >= 4 {
+			if d, err := strconv.Atoi(strings.TrimSpace(parts[3])); err == nil && d > 0 {
+				dur = d
+			}
+		}
 		if id == "" || title == "" {
 			continue
 		}
@@ -676,7 +755,7 @@ func searchYouTubeScraper(query string, maxResults int) []Song {
 			Title:    title + " [YT]",
 			Artist:   artist,
 			AddedAt:  now,
-			Duration: 180,
+			Duration: dur,
 			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
 		})
 	}
@@ -687,15 +766,11 @@ func searchYouTube(query string, maxResults int) []Song {
 	if maxResults <= 0 {
 		maxResults = 6
 	}
-
-	// 1. Official YouTube Data API
 	if apiKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")); apiKey != "" {
 		if songs := searchYouTubeAPI(query, maxResults, apiKey); len(songs) > 0 {
 			return songs
 		}
 	}
-
-	// 2. Fallback: Fast flat-playlist yt-dlp scraper
 	return searchYouTubeScraper(query, maxResults)
 }
 
@@ -1702,7 +1777,6 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use cached/search title directly to eliminate blocking title scraper delay
 	title := song.Title
 	if title == "" {
 		title = ytID
@@ -1717,21 +1791,21 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	execCtx, execCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer execCancel()
 
-	// Fast iOS stream bypasses datacenter blocks and downloads in pure m4a
+	// Direct Format 140 (YouTube's standalone native AAC/M4A) — 0 re-encoding, 3-5 sec fast download
 	var ytArgs []string
 	if len(cookieArgs) > 0 {
 		ytArgs = append(ytArgs, cookieArgs...)
 	}
 	ytArgs = append(ytArgs,
+		"-f", "140/ba[ext=m4a]/ba/b",
 		"-x", "--audio-format", "m4a",
-		"-f", "ba[ext=m4a]/ba/b",
 		"--no-playlist",
 		"--no-check-certificate",
 		"--no-warnings",
 		"--geo-bypass",
 		"--socket-timeout", "15",
-		"--extractor-args", "youtube:player_client=ios,mweb",
-		"-o", filepath.Join("/tmp", "%(id)s.%(ext)s"),
+		"--extractor-args", "youtube:player_client=android",
+		"-o", tmpFile,
 		"https://www.youtube.com/watch?v="+ytID,
 	)
 
@@ -1750,7 +1824,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	fileID := ""
 	fp := ""
 
-	// Background non-blocking Telegram backup
+	// Background Telegram sync
 	if token != "" && chatID != "" {
 		go func(tPath, sTitle, sID string) {
 			if f, err := os.Open(tPath); err == nil {
@@ -1793,6 +1867,15 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		}(tmpFile, title, ytID)
 	}
 
+	// Detect actual real duration using ffprobe
+	exactDur := getAudioDuration(tmpFile)
+	if exactDur <= 0 {
+		exactDur = song.Duration
+	}
+	if exactDur <= 0 {
+		exactDur = 180
+	}
+
 	mu.Lock()
 	existing := appDB.Songs[ytID]
 	s := Song{
@@ -1800,7 +1883,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		FileID: fileID, FilePath: fp,
 		AddedAt: existing.AddedAt, PlayCount: existing.PlayCount + 1,
 		LastPlayed: now, Starred: existing.Starred, Rating: existing.Rating,
-		Duration: existing.Duration,
+		Duration: exactDur,
 		CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", ytID),
 	}
 	if s.AddedAt == "" {
@@ -1810,7 +1893,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 	saveDB()
 
-	// 3. Deliver audio stream
+	// Deliver audio stream
 	w.Header().Set("Content-Type", "audio/mp4")
 	http.ServeFile(w, r, tmpFile)
 }
@@ -1831,10 +1914,10 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 	}
 	args = append(args,
 		"--flat-playlist",
-		"--print", "%(id)s|||%(title)s|||%(uploader)s",
+		"--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s",
 		"--no-download",
 		"--playlist-end", fmt.Sprintf("%d", maxVideos),
-		"--extractor-args", "youtube:player_client=android,web",
+		"--extractor-args", "youtube:player_client=android",
 		playlistURL,
 	)
 
@@ -1851,7 +1934,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		if line == "" || strings.HasPrefix(line, "WARNING") || strings.HasPrefix(line, "ERROR") {
 			continue
 		}
-		parts := strings.SplitN(line, "|||", 3)
+		parts := strings.Split(line, "|||")
 		if len(parts) < 2 {
 			continue
 		}
@@ -1861,6 +1944,12 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		if len(parts) >= 3 && strings.TrimSpace(parts[2]) != "" {
 			artist = strings.TrimSpace(parts[2])
 		}
+		dur := 180
+		if len(parts) >= 4 {
+			if d, err := strconv.Atoi(strings.TrimSpace(parts[3])); err == nil && d > 0 {
+				dur = d
+			}
+		}
 		if id == "" || title == "" {
 			continue
 		}
@@ -1869,7 +1958,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 			Title:    title + " [YT]",
 			Artist:   artist,
 			AddedAt:  now,
-			Duration: 180,
+			Duration: dur,
 			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
 		})
 	}
@@ -2524,7 +2613,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	hasAPIKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")) != ""
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v25-fastplay | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
+	fmt.Fprintf(w, "OK v26-fast140 | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
