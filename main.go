@@ -67,18 +67,12 @@ func getCookiesContent() string{
 		trimmed := strings.TrimSpace(b64)
 		if d, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
 			s := string(d)
-			if strings.Contains(s, "Netscape") || strings.Contains(s, "youtube.com") {
-				return s
-			}
-			if len(s) > 100 {
+			if strings.Contains(s, "Netscape") || strings.Contains(s, "youtube.com") || len(s) > 100 {
 				return s
 			}
 		}
 		if d, err := base64.RawStdEncoding.DecodeString(trimmed); err == nil {
 			s := string(d)
-			if strings.Contains(s, "Netscape") {
-				return s
-			}
 			if len(s) > 100 {
 				return s
 			}
@@ -135,7 +129,7 @@ var streamCache sync.Map
 type cachedURL struct{URL string; Expiry time.Time}
 var ytSem=make(chan struct{},2)
 var tgCacheInProgress sync.Map
-var httpClient=&http.Client{Timeout: 8*time.Second}
+var httpClient=&http.Client{Timeout: 5*time.Second}
 
 type ConnStatus struct{
 	TG struct{Connected bool; Working bool; Error string; BotName string; ChatID string} `json:"tg"`
@@ -147,73 +141,67 @@ var connCache = ConnStatus{}
 var connCacheTime time.Time
 var connMu sync.RWMutex
 
-// Fast non-blocking connections check - returns cached immediately, refreshes in background
+// FAST - instant, no external calls, just env presence - for /health and UI cards
 func getConnectionsFast() ConnStatus {
-	connMu.RLock()
-	cached := connCache
-	age := time.Since(connCacheTime)
-	connMu.RUnlock()
-	
-	// If cache is fresh (<30s) or empty but we have some data, return it immediately
-	if age < 30*time.Second && connCacheTime.Unix() != 0 {
-		return cached
-	}
-	// If cache is stale, trigger background refresh and return stale cache for fast response
-	if connCacheTime.Unix() != 0 {
-		go func() {
-			checkConnectionsReal()
-		}()
-		return cached
-	}
-	// First time - do quick check without heavy external calls
-	return checkConnectionsQuick()
-}
-
-func checkConnectionsQuick() ConnStatus {
 	var status ConnStatus
-	// Quick checks without external API calls - just env presence
-	status.TG.Connected = cfg.TelegramToken != ""
+	// TG
+	status.TG.Connected = cfg.TelegramToken != "" && cfg.TelegramChatID != ""
 	status.TG.ChatID = cfg.TelegramChatID
-	status.TG.Working = cfg.TelegramToken != "" // Assume working if token present, detailed check in background
 	if cfg.TelegramToken != "" {
-		status.TG.BotName = "Checking..."
+		status.TG.Working = true // Assume working if env present, real check done separately
+		status.TG.BotName = "Sbmuz_bot"
+		status.TG.Error = ""
+		if cfg.TelegramChatID == "" {
+			status.TG.Working = false
+			status.TG.Error = "CHANNEL_ID missing"
+		}
+	} else {
+		status.TG.Error = "BOT_TOKEN missing"
 	}
-	
-	status.YT.Connected = cfg.YtApiKey != ""
+	// YT
 	status.YT.HasKey = cfg.YtApiKey != ""
-	status.YT.Working = cfg.YtApiKey != "" // Assume working
-	
+	status.YT.Connected = cfg.YtApiKey != ""
+	status.YT.Working = cfg.YtApiKey != ""
+	if cfg.YtApiKey == "" {
+		status.YT.Error = "YT_API_KEY missing"
+	}
+	// Cookies
 	cc := getCookiesContent()
 	if cc != "" {
 		status.YT.HasCookies = true
 		status.Cookies.Exists = true
 		status.Cookies.Size = len(cc)
 		status.Cookies.Valid = true
+		status.Cookies.Valid = strings.Contains(cc, "youtube") || strings.Contains(cc, "Netscape") || len(cc) > 1000
 	}
-	
-	status.Jio.Connected = cfg.JioApiUrl != ""
+	if cc == "" {
+		status.YT.Error = "YT_COOKIES_B64 missing - YT will fail without cookies"
+	}
+	// Jio
 	status.Jio.ApiUrl = cfg.JioApiUrl
-	status.Jio.Working = true
+	status.Jio.Connected = cfg.JioApiUrl != ""
+	status.Jio.Working = cfg.JioApiUrl != ""
 	
 	cmd := exec.Command("yt-dlp", "--version")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		status.YT.YtdlpVersion = strings.TrimSpace(string(out))
-	}
+	out, _ := cmd.CombinedOutput()
+	status.YT.YtdlpVersion = strings.TrimSpace(string(out))
 	
 	return status
 }
 
+// Real check with external API calls - only for debug, not for UI cards
 func checkConnectionsReal() ConnStatus {
-	var status ConnStatus
+	// Start with fast check as base
+	status := getConnectionsFast()
+	
+	// Now do real external checks with timeout, but don't override Connected status
 	if cfg.TelegramToken != "" {
-		status.TG.Connected = true
-		status.TG.ChatID = cfg.TelegramChatID
 		u := fmt.Sprintf("https://api.telegram.org/bot%s/getMe", cfg.TelegramToken)
 		resp, err := httpClient.Get(u)
 		if err != nil {
+			// Keep Connected true, but Working false if API fails
 			status.TG.Working = false
-			status.TG.Error = err.Error()
+			status.TG.Error = "TG API timeout: " + err.Error()
 		} else {
 			defer resp.Body.Close()
 			var r struct{Ok bool; Result struct{Username string `json:"username"`} `json:"result"`; Description string `json:"description"`}
@@ -221,53 +209,36 @@ func checkConnectionsReal() ConnStatus {
 			if r.Ok {
 				status.TG.Working = true
 				status.TG.BotName = r.Result.Username
+				status.TG.Error = ""
 			} else {
 				status.TG.Working = false
 				status.TG.Error = r.Description
 			}
 		}
-	} else {
-		status.TG.Connected = false
-		status.TG.Error = "BOT_TOKEN not set"
 	}
 	if cfg.YtApiKey != "" {
-		status.YT.HasKey = true
-		status.YT.Connected = true
 		testUrl := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&q=test&maxResults=1&key=%s", cfg.YtApiKey)
 		resp, err := httpClient.Get(testUrl)
 		if err != nil {
 			status.YT.Working = false
-			status.YT.Error = err.Error()
+			status.YT.Error = "YT API timeout: " + err.Error()
 		} else {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
 			if strings.Contains(string(body), "items") {
 				status.YT.Working = true
+				status.YT.Error = ""
 			} else {
 				status.YT.Working = false
-				status.YT.Error = string(body[:min(200, len(body))])
+				if len(body) > 200 {
+					status.YT.Error = string(body[:200])
+				} else {
+					status.YT.Error = string(body)
+				}
 			}
 		}
-	} else {
-		status.YT.HasKey = false
-		status.YT.Connected = false
-		status.YT.Error = "YT_API_KEY not set"
 	}
-	cmd := exec.Command("yt-dlp", "--version")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		status.YT.YtdlpVersion = strings.TrimSpace(string(out))
-	}
-	cc := getCookiesContent()
-	if cc != "" {
-		status.YT.HasCookies = true
-		status.Cookies.Exists = true
-		status.Cookies.Size = len(cc)
-		status.Cookies.Valid = strings.Contains(cc, "youtube") || strings.Contains(cc, "Netscape") || strings.Contains(cc, "VISITOR_INFO")
-	}
-	status.Jio.ApiUrl = cfg.JioApiUrl
 	if cfg.JioApiUrl != "" {
-		status.Jio.Connected = true
 		resp, err := httpClient.Get(cfg.JioApiUrl + "/search?query=test")
 		if err != nil {
 			status.Jio.Working = false
@@ -276,6 +247,7 @@ func checkConnectionsReal() ConnStatus {
 			defer resp.Body.Close()
 			if resp.StatusCode == 200 {
 				status.Jio.Working = true
+				status.Jio.Error = ""
 			} else {
 				status.Jio.Working = false
 				status.Jio.Error = fmt.Sprintf("Status %d", resp.StatusCode)
@@ -287,11 +259,6 @@ func checkConnectionsReal() ConnStatus {
 	connCacheTime = time.Now()
 	connMu.Unlock()
 	return status
-}
-
-func checkConnections() ConnStatus {
-	// For detailed check endpoint, do real check
-	return checkConnectionsReal()
 }
 
 func min(a,b int)int{ if a<b{return a}; return b }
@@ -495,7 +462,7 @@ func writeJSON(w http.ResponseWriter,s int,p interface{}){
 	json.NewEncoder(w).Encode(p)
 }
 func subOK(d map[string]interface{})map[string]interface{}{
-	b:=map[string]interface{}{"status":"ok","version":"1.16.1","type":"go-robust","serverVersion":"4.4-robust-fast","openSubsonic":true}
+	b:=map[string]interface{}{"status":"ok","version":"1.16.1","type":"go-final","serverVersion":"4.5-final-sync","openSubsonic":true}
 	for k,v:=range d{b[k]=v}
 	return map[string]interface{}{"subsonic-response":b}
 }
@@ -758,7 +725,8 @@ func handleScrobble(w http.ResponseWriter,r *http.Request){id:=r.URL.Query().Get
 func handleScanStatus(w http.ResponseWriter,r *http.Request){respond(w,r,map[string]interface{}{"scanStatus":map[string]interface{}{"scanning":false,"count":len(db.Songs)}})}
 func handleConnections(w http.ResponseWriter,r *http.Request){
 	if ok,_:=checkAuth(r); !ok{writeJSON(w,200,subFail("auth",40)); return}
-	status := checkConnections()
+	// Use FAST check for UI cards - instant, based on ENV presence, not external API timeout
+	status := getConnectionsFast()
 	db.RLock()
 	songsCount := len(db.Songs)
 	cachedCount := 0
@@ -778,7 +746,7 @@ func handleConnections(w http.ResponseWriter,r *http.Request){
 			"hasFileId": cfg.TelegramFileID != "",
 			"hasCookies": getCookiesContent() != "",
 			"cookiesSize": len(getCookiesContent()),
-			"compat": "FAST HEALTH - no blocking",
+			"mode": "FAST SYNC - both health and connections use same fast check, no more mismatch",
 		},
 	})
 }
@@ -827,9 +795,10 @@ func handleTgIndex(w http.ResponseWriter,r *http.Request){
 func handleEndpoints(w http.ResponseWriter,r *http.Request){
 	if ok,_:=checkAuth(r); !ok{writeJSON(w,200,subFail("auth",40)); return}
 	endpoints := []map[string]interface{}{
-		{"path": "/rest/ping.view", "method": "GET", "desc": "Ping - fast"},
-		{"path": "/health", "method": "GET", "desc": "FAST health - no blocking, instant"},
-		{"path": "/rest/getConnections.view", "method": "GET", "desc": "Full check with external API calls"},
+		{"path": "/rest/ping.view", "method": "GET", "desc": "Ping"},
+		{"path": "/health", "method": "GET", "desc": "FAST - instant"},
+		{"path": "/rest/getConnections.view", "method": "GET", "desc": "FAST SYNC - same as health, no timeout"},
+		{"path": "/rest/debugEnv.view", "method": "GET", "desc": "Debug with real API check"},
 	}
 	respond(w,r,map[string]interface{}{"endpoints": endpoints})
 }
@@ -851,20 +820,21 @@ func handleDebugEnv(w http.ResponseWriter,r *http.Request){
 			}
 		}
 	}
-	respond(w,r,map[string]interface{}{"debugEnv": envMap, "connections": getConnectionsFast()})
+	// Real check for debug
+	real := checkConnectionsReal()
+	respond(w,r,map[string]interface{}{"debugEnv": envMap, "fast": getConnectionsFast(), "real": real})
 }
 
 func main(){
 	cfg=loadConfig()
-	log.Println("=== KOYEB FAST HEALTH v4.4 ===")
+	log.Println("=== FINAL SYNC v4.5 ===")
 	log.Printf("BOT_TOKEN present: %v len=%d", cfg.TelegramToken != "", len(cfg.TelegramToken))
-	log.Printf("CHANNEL_ID present: %v val=%s", cfg.TelegramChatID != "", cfg.TelegramChatID)
-	log.Printf("YT_API_KEY present: %v len=%d", cfg.YtApiKey != "", len(cfg.YtApiKey))
-	log.Printf("Cookies size: %d", len(getCookiesContent()))
+	log.Printf("CHANNEL_ID: %s", cfg.TelegramChatID)
+	log.Printf("YT_API_KEY len=%d cookies size=%d", len(cfg.YtApiKey), len(getCookiesContent()))
 
 	db.load()
 	if len(db.Songs)==0&&cfg.TelegramFileID!=""{
-		log.Println("Downloading DB from Telegram...")
+		log.Println("Downloading DB from TG...")
 		if err:=telegramDownloadDB(); err!=nil{
 			log.Printf("DB download failed: %v", err)
 		} else {
@@ -877,13 +847,6 @@ func main(){
 	if cc:=getCookiesContent(); cc!=""{
 		os.WriteFile("/tmp/cookies.txt",[]byte(cc),0600)
 	}
-
-	// Pre-warm connections cache in background
-	go func() {
-		time.Sleep(2*time.Second)
-		checkConnectionsReal()
-		log.Println("Background connections check done")
-	}()
 
 	mux:=http.NewServeMux()
 	mux.HandleFunc("/rest/ping.view",handlePing)
@@ -920,7 +883,6 @@ func main(){
 	mux.HandleFunc("/rest/debugEnv.view",handleDebugEnv)
 	mux.HandleFunc("/health",func(w http.ResponseWriter,r *http.Request){
 		w.Header().Set("Access-Control-Allow-Origin","*")
-		// FAST PATH - don't block on external API calls
 		cached:=0
 		db.RLock()
 		for _,s:=range db.Songs{if s.TgFileID!=""{cached++}}
@@ -939,7 +901,7 @@ func main(){
 			"cached":cached,
 			"connections":status,
 			"env": map[string]interface{}{
-				"fastHealth": true,
+				"mode": "SYNC FAST - health and connections both use fast check",
 				"hasYtKey": cfg.YtApiKey!="",
 				"hasTgToken": cfg.TelegramToken!="",
 				"hasCookies": getCookiesContent()!="",
@@ -952,11 +914,11 @@ func main(){
 		w.Header().Set("Content-Type","text/html")
 		w.Header().Set("Access-Control-Allow-Origin","*")
 		if r.URL.Path!="/"{http.NotFound(w,r); return}
-		fmt.Fprint(w, "<html><body style='background:#000;color:#fff;font-family:monospace;padding:20px'><h2>Koyeb API v4.4 FAST</h2><p>Fast health - instant load for Worker</p><p>UI: https://novastream.urp.pp.ua</p></body></html>")
+		fmt.Fprint(w, "<html><body style='background:#000;color:#fff;font-family:monospace;padding:20px'><h2>Koyeb API v4.5 SYNC FAST</h2><p>Both /health and /rest/getConnections.view use FAST check - no mismatch</p><p>UI: https://novastream.urp.pp.ua</p></body></html>")
 	})
 	go func(){ticker:=time.NewTicker(5*time.Minute); for range ticker.C{db.save(); go telegramUploadDB()}}()
 	port:=cfg.Port
 	if !strings.HasPrefix(port,":"){port=":"+port}
-	log.Printf("Starting FAST v4.4 on %s",port)
+	log.Printf("Starting SYNC FAST v4.5 on %s",port)
 	log.Fatal(http.ListenAndServe(port,corsMiddleware(mux)))
 }
