@@ -567,7 +567,7 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-// -------------------- YouTube Engine --------------------
+// -------------------- YouTube Engine (Search & Title) --------------------
 
 func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
@@ -612,24 +612,75 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 	return title, artist
 }
 
-func searchYouTube(query string, maxResults int) []Song {
-	if maxResults <= 0 {
-		maxResults = 5
+func searchYouTubeAPI(query string, maxResults int, apiKey string) []Song {
+	apiURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=%d&q=%s&key=%s",
+		maxResults, url.QueryEscape(query), apiKey)
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(apiURL)
+	if err != nil {
+		log.Printf("[YT API] Request error: %v", err)
+		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[YT API] Non-200 response: %d", resp.StatusCode)
+		return nil
+	}
+
+	var res struct {
+		Items []struct {
+			ID struct {
+				VideoID string `json:"videoId"`
+			} `json:"id"`
+			Snippet struct {
+				Title        string `json:"title"`
+				ChannelTitle string `json:"channelTitle"`
+			} `json:"snippet"`
+		} `json:"items"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil
+	}
+
+	var results []Song
+	now := time.Now().Format(time.RFC3339)
+	for _, item := range res.Items {
+		if item.ID.VideoID == "" {
+			continue
+		}
+		title := html.UnescapeString(item.Snippet.Title)
+		artist := html.UnescapeString(item.Snippet.ChannelTitle)
+		if artist == "" {
+			artist = "YouTube"
+		}
+		results = append(results, Song{
+			YTID:     item.ID.VideoID,
+			Title:    title + " [YT]",
+			Artist:   artist,
+			AddedAt:  now,
+			Duration: 180,
+			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", item.ID.VideoID),
+		})
+	}
+	return results
+}
+
+func searchYouTubeScraper(query string, maxResults int) []Song {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	cookieArgs := getCookiesArg()
 	searchTerm := fmt.Sprintf("ytsearch%d:%s", maxResults, query)
 
 	args := []string{
+		"--flat-playlist",
 		"--print", "%(id)s|||%(title)s|||%(uploader)s",
 		"--no-download",
-		"--no-playlist",
 		"--no-check-certificate",
 		"--no-warnings",
 		"--geo-bypass",
-		"--extractor-args", "youtube:player_client=android,web",
 	}
 	if len(cookieArgs) > 0 {
 		args = append(cookieArgs, args...)
@@ -639,11 +690,12 @@ func searchYouTube(query string, maxResults int) []Song {
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[YT Search] Scraper error: %v", err)
+		log.Printf("[YT Scraper] Error: %v | Log: %s", err, string(out))
 		return nil
 	}
 
 	var results []Song
+	now := time.Now().Format(time.RFC3339)
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "WARNING") || strings.HasPrefix(line, "ERROR") {
@@ -666,12 +718,28 @@ func searchYouTube(query string, maxResults int) []Song {
 			YTID:     id,
 			Title:    title + " [YT]",
 			Artist:   artist,
-			AddedAt:  time.Now().Format(time.RFC3339),
+			AddedAt:  now,
 			Duration: 180,
 			CoverArt: fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
 		})
 	}
 	return results
+}
+
+func searchYouTube(query string, maxResults int) []Song {
+	if maxResults <= 0 {
+		maxResults = 6
+	}
+
+	// 1. Official YouTube Data API (Instant & never blocked)
+	if apiKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")); apiKey != "" {
+		if songs := searchYouTubeAPI(query, maxResults, apiKey); len(songs) > 0 {
+			return songs
+		}
+	}
+
+	// 2. Fallback: Fast yt-dlp flat playlist scraper
+	return searchYouTubeScraper(query, maxResults)
 }
 
 // -------------------- Subsonic API Endpoints --------------------
@@ -1684,7 +1752,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		artist = "YouTube"
 	}
 
-	// 90-Second context prevents persistent hangs
+	// 90-second context timeout prevents permanent concurrency freeze
 	execCtx, execCancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer execCancel()
 
@@ -1786,7 +1854,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 	cookieArgs := getCookiesArg()
 	var args []string
 	if len(cookieArgs) > 0 {
-		args = append(cookieArgs, args...)
+		args = append(cookieArgs...)
 	}
 	args = append(args,
 		"--flat-playlist",
@@ -2328,7 +2396,7 @@ func parseJioImage(raw json.RawMessage) string {
 	}
 	var arr []struct {
 		Quality string `json:"quality"`
-		URL     string `json:"URL"`
+		URL     string `json:"url"`
 	}
 	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
 		return arr[len(arr)-1].URL
@@ -2480,8 +2548,10 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		fid = "Not configured"
 	}
 
+	hasAPIKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")) != ""
+
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v23-stable | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, admin, fid)
+	fmt.Fprintf(w, "OK v24-ytapi | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
