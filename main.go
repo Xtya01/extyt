@@ -583,7 +583,7 @@ func getYTTitle(ytUrl string, cookieArgs []string) (title, artist string) {
 		"--extractor-args", "youtube:player_client=android,web",
 	}
 	if len(cookieArgs) > 0 {
-		args = append(cookieArgs, args...)
+		args = append(args, cookieArgs...)
 	}
 	args = append(args, ytUrl)
 
@@ -683,7 +683,7 @@ func searchYouTubeScraper(query string, maxResults int) []Song {
 		"--geo-bypass",
 	}
 	if len(cookieArgs) > 0 {
-		args = append(cookieArgs, args...)
+		args = append(args, cookieArgs...)
 	}
 	args = append(args, searchTerm)
 
@@ -731,14 +731,14 @@ func searchYouTube(query string, maxResults int) []Song {
 		maxResults = 6
 	}
 
-	// 1. Official YouTube Data API (Instant & never blocked)
+	// 1. Official YouTube Data API
 	if apiKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")); apiKey != "" {
 		if songs := searchYouTubeAPI(query, maxResults, apiKey); len(songs) > 0 {
 			return songs
 		}
 	}
 
-	// 2. Fallback: Fast yt-dlp flat playlist scraper
+	// 2. Fallback: Fast flat playlist yt-dlp scraper
 	return searchYouTubeScraper(query, maxResults)
 }
 
@@ -1854,7 +1854,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 	cookieArgs := getCookiesArg()
 	var args []string
 	if len(cookieArgs) > 0 {
-		args = append(cookieArgs...)
+		args = append(args, cookieArgs...)
 	}
 	args = append(args,
 		"--flat-playlist",
@@ -2396,7 +2396,7 @@ func parseJioImage(raw json.RawMessage) string {
 	}
 	var arr []struct {
 		Quality string `json:"quality"`
-		URL     string `json:"url"`
+		URL     string `json:"URL"`
 	}
 	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
 		return arr[len(arr)-1].URL
