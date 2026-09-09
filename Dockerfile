@@ -1,22 +1,22 @@
-# Stage 1: Static binary build
+# Stage 1: Build Go binary
 FROM golang:1.22-bookworm AS builder
 WORKDIR /app
 COPY main.go ./
 RUN GO111MODULE=off CGO_ENABLED=0 go build -ldflags="-s -w" -o server main.go
 
-# Stage 2: Minimal runtime environment for Koyeb Free Tier
+# Stage 2: Minimal runtime
 FROM debian:bookworm-slim
 
+# Install only necessary packages (no Python)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     ca-certificates \
-    python3 \
-    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Standalone yt-dlp binary
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp
+# Standalone yt-dlp binary (no system Python required)
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app
 COPY --from=builder /app/server /app/server
