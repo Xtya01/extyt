@@ -608,7 +608,7 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-// -------------------- YouTube Engine (Search & Title) --------------------
+// -------------------- YouTube Engine (Search & Exact Duration) --------------------
 
 func searchYouTubeAPI(query string, maxResults int, apiKey string) []Song {
 	searchURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=%d&q=%s&key=%s",
@@ -647,7 +647,6 @@ func searchYouTubeAPI(query string, maxResults int, apiKey string) []Song {
 		}
 	}
 
-	// Fetch exact video duration using contentDetails
 	durationMap := make(map[string]int)
 	if len(vIDs) > 0 {
 		detailURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=%s&key=%s",
@@ -714,7 +713,7 @@ func searchYouTubeScraper(query string, maxResults int) []Song {
 		"--geo-bypass",
 	}
 	if len(cookieArgs) > 0 {
-		args = append(args, cookieArgs...)
+		args = append(cookieArgs, args...)
 	}
 	args = append(args, searchTerm)
 
@@ -973,29 +972,6 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 			writeSubsonicError(w, 10, "Missing id", f)
 			return
 		}
-
-		go func(sid, uname string) {
-			mu.Lock()
-			now := time.Now().Format(time.RFC3339)
-			if s, ok := appDB.Songs[sid]; ok {
-				s.PlayCount++
-				s.LastPlayed = now
-				appDB.Songs[sid] = s
-			}
-			if u, ok := appDB.Users[uname]; ok {
-				if u.PlayCount == nil {
-					u.PlayCount = make(map[string]int)
-				}
-				if u.LastPlayed == nil {
-					u.LastPlayed = make(map[string]string)
-				}
-				u.PlayCount[sid]++
-				u.LastPlayed[sid] = now
-				appDB.Users[uname] = u
-			}
-			mu.Unlock()
-			saveDB()
-		}(id, currentUser)
 
 		if strings.HasPrefix(id, "js-") {
 			streamURL := getJioStreamURL(id)
@@ -1769,11 +1745,12 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	sem <- struct{}{}
 	defer func() { <-sem }()
 
+	targetFile := filepath.Join("/tmp", ytID+".m4a")
+
 	// 2. Instant stream if cached in local disk (/tmp)
-	tmpFile := filepath.Join("/tmp", ytID+".m4a")
-	if _, err := os.Stat(tmpFile); err == nil {
+	if _, err := os.Stat(targetFile); err == nil {
 		w.Header().Set("Content-Type", "audio/mp4")
-		http.ServeFile(w, r, tmpFile)
+		http.ServeFile(w, r, targetFile)
 		return
 	}
 
@@ -1791,31 +1768,53 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	execCtx, execCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer execCancel()
 
-	// Direct Format 140 (YouTube's standalone native AAC/M4A) — 0 re-encoding, 3-5 sec fast download
+	outputTemplate := filepath.Join("/tmp", ytID+".%(ext)s")
+
+	// Formats compatible with browser cookies & bypasses datacenter blocks
 	var ytArgs []string
 	if len(cookieArgs) > 0 {
 		ytArgs = append(ytArgs, cookieArgs...)
 	}
 	ytArgs = append(ytArgs,
-		"-f", "140/ba[ext=m4a]/ba/b",
+		"-f", "ba/ba*/b",
 		"-x", "--audio-format", "m4a",
+		"--audio-quality", "0",
 		"--no-playlist",
 		"--no-check-certificate",
 		"--no-warnings",
 		"--geo-bypass",
 		"--socket-timeout", "15",
-		"--extractor-args", "youtube:player_client=android",
-		"-o", tmpFile,
+		"--extractor-args", "youtube:player_client=mweb,web,android",
+		"-o", outputTemplate,
 		"https://www.youtube.com/watch?v="+ytID,
 	)
 
 	cmd := exec.CommandContext(execCtx, "yt-dlp", ytArgs...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		os.Remove(tmpFile)
 		log.Printf("[YT Stream Error] yt-dlp failed for %s: %v | Log: %s", ytID, err, string(out))
 		http.Error(w, fmt.Sprintf("yt-dlp error: %v\n%s", err, string(out)), 500)
 		return
+	}
+
+	// Smart file locator: Auto-fixes double extension (.m4a.m4a or .webm)
+	matches, _ := filepath.Glob(filepath.Join("/tmp", ytID+"*"))
+	var foundFile string
+	for _, m := range matches {
+		if strings.HasSuffix(m, ".m4a") || strings.HasSuffix(m, ".mp3") || strings.HasSuffix(m, ".webm") {
+			foundFile = m
+			break
+		}
+	}
+
+	if foundFile == "" {
+		log.Printf("[YT Stream Error] No valid audio file found on disk for %s", ytID)
+		http.Error(w, "Audio file extraction failed", 500)
+		return
+	}
+
+	if foundFile != targetFile {
+		os.Rename(foundFile, targetFile)
 	}
 
 	now := time.Now().Format(time.RFC3339)
@@ -1864,11 +1863,10 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-		}(tmpFile, title, ytID)
+		}(targetFile, title, ytID)
 	}
 
-	// Detect actual real duration using ffprobe
-	exactDur := getAudioDuration(tmpFile)
+	exactDur := getAudioDuration(targetFile)
 	if exactDur <= 0 {
 		exactDur = song.Duration
 	}
@@ -1893,9 +1891,9 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 	saveDB()
 
-	// Deliver audio stream
+	// Deliver audio stream with Range support
 	w.Header().Set("Content-Type", "audio/mp4")
-	http.ServeFile(w, r, tmpFile)
+	http.ServeFile(w, r, targetFile)
 }
 
 // -------------------- Multi-User True Mirror Sync --------------------
@@ -1917,7 +1915,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		"--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s",
 		"--no-download",
 		"--playlist-end", fmt.Sprintf("%d", maxVideos),
-		"--extractor-args", "youtube:player_client=android",
+		"--extractor-args", "youtube:player_client=mweb,web,android",
 		playlistURL,
 	)
 
@@ -2613,7 +2611,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	hasAPIKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")) != ""
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v26-fast140 | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
+	fmt.Fprintf(w, "OK v27-smartstream | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
