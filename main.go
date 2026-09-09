@@ -81,14 +81,15 @@ var (
 		Playlists: make(map[string]Playlist),
 		Users:     make(map[string]User),
 	}
-	mu           sync.RWMutex
-	backupLock   sync.Mutex
-	cookieOnce   sync.Once
-	hasCookies   bool
-	latestFileID string
-	searchCache  sync.Map
-	sem          = make(chan struct{}, 2)
-	lastBackup   time.Time
+	mu              sync.RWMutex
+	backupLock      sync.Mutex
+	cookieOnce      sync.Once
+	hasCookies      bool
+	latestFileID    string
+	latestMessageID int
+	searchCache     sync.Map
+	sem             = make(chan struct{}, 2)
+	lastBackup      time.Time
 )
 
 const dbPath = "/tmp/db.json"
@@ -258,6 +259,17 @@ func backupDBToTelegram() {
 		return
 	}
 
+	// Delete previous backup message
+	if latestMessageID > 0 {
+		deleteURL := fmt.Sprintf("https://api.telegram.org/bot%s/deleteMessage?chat_id=%s&message_id=%d", token, chatID, latestMessageID)
+		client := &http.Client{Timeout: 10 * time.Second}
+		if resp, err := client.Get(deleteURL); err == nil {
+			resp.Body.Close()
+			log.Printf("[Telegram Backup] Old message deleted: %d", latestMessageID)
+		}
+		latestMessageID = 0
+	}
+
 	mu.RLock()
 	songCnt := len(appDB.Songs)
 	plCnt := len(appDB.Playlists)
@@ -294,14 +306,16 @@ func backupDBToTelegram() {
 	var res struct {
 		Ok     bool `json:"ok"`
 		Result struct {
-			Document struct {
+			MessageID int `json:"message_id"`
+			Document  struct {
 				FileID string `json:"file_id"`
 			} `json:"document"`
 		} `json:"result"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&res) == nil && res.Ok {
 		latestFileID = res.Result.Document.FileID
-		log.Printf("[Telegram Backup] Synced! FileID: %s", latestFileID)
+		latestMessageID = res.Result.MessageID
+		log.Printf("[Telegram Backup] Synced! FileID: %s | MessageID: %d", latestFileID, latestMessageID)
 	}
 }
 
@@ -1744,7 +1758,7 @@ func subsonicHandler(w http.ResponseWriter, r *http.Request) {
 func playHandler(w http.ResponseWriter, r *http.Request) {
 	ytUrl := r.URL.Query().Get("url")
 	if ytUrl == "" {
-		http.Error(w, "Query parameter url is required", 400)
+		http.Error(w, "Missing YouTube URL", 400)
 		return
 	}
 
@@ -1760,7 +1774,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	song, exists := appDB.Songs[ytID]
 	mu.RUnlock()
 
-	// 1. Instant stream if Telegram cache exists
+	// 1. Instant stream from Telegram cache
 	if exists && song.FileID != "" {
 		token := strings.TrimSpace(os.Getenv("BOT_TOKEN"))
 		fp := song.FilePath
@@ -1778,7 +1792,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 
 	targetFile := filepath.Join("/tmp", ytID+".m4a")
 
-	// 2. Instant stream if cached in local disk
+	// 2. Instant stream from local disk
 	if _, err := os.Stat(targetFile); err == nil {
 		w.Header().Set("Content-Type", "audio/mp4")
 		http.ServeFile(w, r, targetFile)
@@ -1816,7 +1830,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 		"--geo-bypass",
 		"--socket-timeout", "25",
 		"--retries", "3",
-		"--extractor-args", "youtube:player_client=android,ios,web,mweb,tv",
+		"--extractor-args", "youtube:player_client=android,tv",
 		"-o", outputTemplate,
 		"https://www.youtube.com/watch?v="+ytID,
 	)
@@ -1824,8 +1838,30 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.CommandContext(execCtx, "yt-dlp", ytArgs...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[YT Stream Error] yt-dlp failed for %s: %v | Log: %s", ytID, err, string(out))
-		http.Error(w, "Audio extraction failed. Please try again later.", 500)
+		errMsg := string(out)
+		log.Printf("[YT Stream Error] yt-dlp failed for %s: %v | Log: %s", ytID, err, errMsg)
+
+		userMsg := "YouTube extraction failed"
+		switch {
+		case strings.Contains(errMsg, "The page needs to be reloaded"):
+			userMsg = "YouTube blocked this request (page reload needed). Try again later."
+		case strings.Contains(errMsg, "Requested format is not available"):
+			userMsg = "Audio format not available for this video."
+		case strings.Contains(errMsg, "Sign in to confirm"):
+			userMsg = "This video requires sign-in / age verification."
+		case strings.Contains(errMsg, "Private video"):
+			userMsg = "This is a private YouTube video."
+		case strings.Contains(errMsg, "Video unavailable"):
+			userMsg = "Video is unavailable or deleted."
+		case strings.Contains(errMsg, "confirm your age"):
+			userMsg = "Age-restricted video. Cookies may be needed."
+		case strings.Contains(errMsg, "HTTP Error 403"):
+			userMsg = "YouTube returned 403 Forbidden (IP/cookies issue)."
+		case strings.Contains(errMsg, "timed out") || strings.Contains(errMsg, "timeout"):
+			userMsg = "YouTube request timed out. Try again."
+		}
+
+		http.Error(w, userMsg, 500)
 		return
 	}
 
@@ -1841,7 +1877,7 @@ func playHandler(w http.ResponseWriter, r *http.Request) {
 
 	if foundFile == "" {
 		log.Printf("[YT Stream Error] No valid audio file found for %s", ytID)
-		http.Error(w, "Audio file extraction failed", 500)
+		http.Error(w, "Audio file could not be extracted from YouTube.", 500)
 		return
 	}
 
@@ -1950,7 +1986,7 @@ func fetchYTPlaylistSongs(playlistURL string, maxVideos int) ([]Song, error) {
 		"--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s",
 		"--no-download",
 		"--playlist-end", fmt.Sprintf("%d", maxVideos),
-		"--extractor-args", "youtube:player_client=android,ios,web,mweb,tv",
+		"--extractor-args", "youtube:player_client=android,tv",
 		playlistURL,
 	)
 
@@ -2646,7 +2682,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	hasAPIKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")) != ""
 
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "OK v28-smartstream | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
+	fmt.Fprintf(w, "OK v29-smartstream | Songs: %d | Playlists: %d | Users: %d | Cookies: %v | YT_API: %v | Admin: %s\nDB_JSON_FILE_ID: %s\n", c, pc, uc, cookies, hasAPIKey, admin, fid)
 }
 
 // -------------------- Global CORS Middleware --------------------
