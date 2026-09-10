@@ -692,6 +692,9 @@ func respond(w http.ResponseWriter, r *http.Request, d map[string]interface{}) {
 func requireAuth(w http.ResponseWriter, r *http.Request) (string, bool) {
 	ok, user := checkAuth(r)
 	if !ok {
+		log.Printf("AUTH FAIL path=%s u=%s hasP=%v hasT=%v",
+			r.URL.Path, r.URL.Query().Get("u"),
+			r.URL.Query().Get("p") != "", r.URL.Query().Get("t") != "")
 		writeJSON(w, 200, subFail("Wrong username or password", 40))
 		return "", false
 	}
@@ -706,6 +709,16 @@ func corsMiddleware(next http.Handler) http.Handler {
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)
 			return
+		}
+		// Log every incoming request (helps debug Substreamer)
+		if strings.HasPrefix(r.URL.Path, "/rest/") {
+			log.Printf("IN %s %s u=%s query=%s f=%s c=%s",
+				r.Method, r.URL.Path,
+				r.URL.Query().Get("u"),
+				r.URL.Query().Get("query"),
+				r.URL.Query().Get("f"),
+				r.URL.Query().Get("c"),
+			)
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -1739,13 +1752,26 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 		offset = 0
 	}
 	var jio, yt, audius, deezer []*Song
+	var errJ, errY, errA, errD error
 	var wg sync.WaitGroup
 	wg.Add(4)
-	go func() { defer wg.Done(); jio, _ = searchJio(q) }()
-	go func() { defer wg.Done(); yt, _ = searchYoutube(q) }()
-	go func() { defer wg.Done(); audius, _ = searchAudius(q) }()
-	go func() { defer wg.Done(); deezer, _ = searchDeezer(q) }()
+	go func() { defer wg.Done(); jio, errJ = searchJio(q) }()
+	go func() { defer wg.Done(); yt, errY = searchYoutube(q) }()
+	go func() { defer wg.Done(); audius, errA = searchAudius(q) }()
+	go func() { defer wg.Done(); deezer, errD = searchDeezer(q) }()
 	wg.Wait()
+	if errJ != nil {
+		log.Printf("searchJio err: %v", errJ)
+	}
+	if errY != nil {
+		log.Printf("searchYoutube err: %v", errY)
+	}
+	if errA != nil {
+		log.Printf("searchAudius err: %v", errA)
+	}
+	if errD != nil {
+		log.Printf("searchDeezer err: %v", errD)
+	}
 
 	// Interleave sources for variety: Jio, YT, Audius, Deezer
 	all := []*Song{}
@@ -1779,12 +1805,19 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 	if len(all) > sCount {
 		all = all[:sCount]
 	}
-	var res []map[string]interface{}
+	res := make([]map[string]interface{}, 0, len(all))
 	for _, s := range all {
 		res = append(res, songToSubsonic(s, r))
 	}
 	log.Printf("SEARCH '%s' -> JIO:%d YT:%d Audius:%d Deezer:%d Total:%d", q, len(jio), len(yt), len(audius), len(deezer), len(res))
-	respond(w, r, map[string]interface{}{"searchResult3": map[string]interface{}{"song": res, "album": []interface{}{}, "artist": []interface{}{}}})
+	// Always use empty slices (never null) — Substreamer breaks on null
+	respond(w, r, map[string]interface{}{
+		"searchResult3": map[string]interface{}{
+			"song":   res,
+			"album":  []map[string]interface{}{},
+			"artist": []map[string]interface{}{},
+		},
+	})
 }
 
 func handleAlbumList2(w http.ResponseWriter, r *http.Request) {
