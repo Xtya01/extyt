@@ -835,9 +835,8 @@ func searchJio(query string) ([]*Song, error) {
 		return nil, nil
 	}
 	endpoints := []string{
-		fmt.Sprintf("%s/search?query=%s", cfg.JioApiUrl, url.QueryEscape(query)),
-		fmt.Sprintf("%s/search/songs?query=%s&limit=40", cfg.JioApiUrl, url.QueryEscape(query)),
-		fmt.Sprintf("https://saavn.dev/api/search/songs?query=%s", url.QueryEscape(query)),
+		fmt.Sprintf("%s/search?query=%s", strings.TrimRight(cfg.JioApiUrl, "/"), url.QueryEscape(query)),
+		fmt.Sprintf("https://saavn.sumit.co/api/search/songs?query=%s", url.QueryEscape(query)),
 	}
 	var allSongs []*Song
 	seen := map[string]bool{}
@@ -849,7 +848,8 @@ func searchJio(query string) ([]*Song, error) {
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if len(body) < 10 {
+		if len(body) < 10 || resp.StatusCode != 200 {
+			log.Printf("JIO bad response %s status=%d len=%d", ep, resp.StatusCode, len(body))
 			continue
 		}
 		var g map[string]interface{}
@@ -857,6 +857,7 @@ func searchJio(query string) ([]*Song, error) {
 			continue
 		}
 		var raw []interface{}
+		// formats: {data:{results:[]}} | {data:{songs:{results:[]}}} | {data:[]} | {success,data:[]}
 		if data, ok := g["data"].(map[string]interface{}); ok {
 			if res, ok := data["results"].([]interface{}); ok {
 				raw = res
@@ -864,6 +865,8 @@ func searchJio(query string) ([]*Song, error) {
 				if results, ok := res["results"].([]interface{}); ok {
 					raw = results
 				}
+			} else if res, ok := data["songs"].([]interface{}); ok {
+				raw = res
 			}
 		} else if data, ok := g["data"].([]interface{}); ok {
 			raw = data
@@ -871,11 +874,16 @@ func searchJio(query string) ([]*Song, error) {
 			raw = results
 		}
 		if len(raw) == 0 {
+			log.Printf("JIO parse empty results from %s", ep)
 			continue
 		}
 		for _, rs := range raw {
 			m, ok := rs.(map[string]interface{})
 			if !ok || m == nil {
+				continue
+			}
+			// skip non-song entries from mixed search
+			if t, _ := m["type"].(string); t != "" && t != "song" {
 				continue
 			}
 			title, _ := m["name"].(string)
@@ -888,16 +896,28 @@ func searchJio(query string) ([]*Song, error) {
 			artist := ""
 			if pa, ok := m["primaryArtists"].(string); ok && pa != "" {
 				artist = pa
+			} else if sub, ok := m["subtitle"].(string); ok && sub != "" {
+				// "Artist - Album" style
+				if i := strings.Index(sub, " - "); i > 0 {
+					artist = strings.TrimSpace(sub[:i])
+				} else {
+					artist = sub
+				}
 			} else if artistsField, ok := m["artists"]; ok && artistsField != nil {
 				if artistsMap, ok := artistsField.(map[string]interface{}); ok {
-					if primary, ok := artistsMap["primary"].(string); ok && primary != "" {
-						artist = primary
-					} else if primaryArr, ok := artistsMap["primary"].([]interface{}); ok && len(primaryArr) > 0 {
+					if primaryArr, ok := artistsMap["primary"].([]interface{}); ok && len(primaryArr) > 0 {
 						if first, ok := primaryArr[0].(map[string]interface{}); ok {
 							if name, ok := first["name"].(string); ok {
 								artist = name
 							}
 						}
+					}
+				}
+			}
+			if artist == "" {
+				if mi, ok := m["more_info"].(map[string]interface{}); ok {
+					if music, ok := mi["music"].(string); ok && music != "" {
+						artist = music
 					}
 				}
 			}
@@ -915,13 +935,17 @@ func searchJio(query string) ([]*Song, error) {
 			seen[sid] = true
 			thumb := parseJioImage(m["image"])
 			artistObj := ensureArtist(artist)
-			albumName := title + " Single"
+			albumName := title
 			if alb, ok := m["album"].(map[string]interface{}); ok {
 				if an, ok := alb["name"].(string); ok && an != "" {
 					albumName = an
 				}
 			} else if an, ok := m["album"].(string); ok && an != "" {
 				albumName = an
+			} else if mi, ok := m["more_info"].(map[string]interface{}); ok {
+				if an, ok := mi["album"].(string); ok && an != "" {
+					albumName = an
+				}
 			}
 			albumObj := ensureAlbum(albumName, artist, artistObj.ID, thumb)
 			dur := 210
@@ -930,6 +954,12 @@ func searchJio(query string) ([]*Song, error) {
 			} else if d, ok := m["duration"].(string); ok {
 				if di, err := strconv.Atoi(d); err == nil && di > 0 {
 					dur = di
+				}
+			} else if mi, ok := m["more_info"].(map[string]interface{}); ok {
+				if d, ok := mi["duration"].(string); ok {
+					if di, err := strconv.Atoi(d); err == nil && di > 0 {
+						dur = di
+					}
 				}
 			}
 			s := &Song{
@@ -948,7 +978,7 @@ func searchJio(query string) ([]*Song, error) {
 			}
 			db.Unlock()
 		}
-		if len(allSongs) >= 20 {
+		if len(allSongs) >= 25 {
 			break
 		}
 	}
@@ -969,14 +999,15 @@ func getJioStream(jioId string) (string, error) {
 			return c.URL, nil
 		}
 	}
+	// saavn.sumit.co returns clear downloadUrl with 320kbps
 	endpoints := []string{
-		fmt.Sprintf("%s/songs?id=%s", cfg.JioApiUrl, jioId),
-		fmt.Sprintf("%s/song?id=%s", cfg.JioApiUrl, jioId),
-		fmt.Sprintf("https://saavn.dev/api/songs/%s", jioId),
+		fmt.Sprintf("https://saavn.sumit.co/api/songs/%s", jioId),
+		fmt.Sprintf("%s/songs?id=%s", strings.TrimRight(cfg.JioApiUrl, "/"), jioId),
 	}
 	for _, ep := range endpoints {
 		resp, err := httpClient.Get(ep)
 		if err != nil {
+			log.Printf("JIO stream fail %s: %v", ep, err)
 			continue
 		}
 		body, _ := io.ReadAll(resp.Body)
@@ -986,6 +1017,7 @@ func getJioStream(jioId string) (string, error) {
 			continue
 		}
 		var dlUrl string
+		// {success:true, data:[{downloadUrl:[...]}]}
 		if data, ok := g["data"].([]interface{}); ok {
 			for _, it := range data {
 				if m, ok := it.(map[string]interface{}); ok {
@@ -995,11 +1027,28 @@ func getJioStream(jioId string) (string, error) {
 							break
 						}
 					}
+					if dl, ok := m["download_url"]; ok {
+						dlUrl = parseJioDownloadUrl(dl)
+						if dlUrl != "" {
+							break
+						}
+					}
 				}
 			}
 		} else if data, ok := g["data"].(map[string]interface{}); ok {
-			if dl, ok := data["downloadUrl"]; ok {
-				dlUrl = parseJioDownloadUrl(dl)
+			if songs, ok := data["songs"].([]interface{}); ok {
+				for _, it := range songs {
+					if m, ok := it.(map[string]interface{}); ok {
+						if dl, ok := m["downloadUrl"]; ok {
+							dlUrl = parseJioDownloadUrl(dl)
+						}
+					}
+				}
+			}
+			if dlUrl == "" {
+				if dl, ok := data["downloadUrl"]; ok {
+					dlUrl = parseJioDownloadUrl(dl)
+				}
 			}
 		}
 		if dlUrl != "" {
@@ -1007,7 +1056,7 @@ func getJioStream(jioId string) (string, error) {
 			return dlUrl, nil
 		}
 	}
-	return "", fmt.Errorf("jio stream not found")
+	return "", fmt.Errorf("jio stream not found for %s", jioId)
 }
 
 type YTSearch struct {
