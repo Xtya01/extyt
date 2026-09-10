@@ -205,43 +205,22 @@ var db = &DB{
 	Starred:   make(map[string]map[string]bool),
 }
 var streamCache sync.Map
-
-type cachedURL struct {
-	URL    string
-	Expiry time.Time
-}
-
+type cachedURL struct{ URL string; Expiry time.Time }
 var ytSem = make(chan struct{}, 2)
 var tgCacheInProgress sync.Map
-var httpClient = &http.Client{Timeout: 8 * time.Second}
+var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 type ConnStatus struct {
 	TG struct {
-		Connected bool
-		Working   bool
-		Error     string
-		BotName   string
-		ChatID    string
+		Connected bool; Working bool; Error string; BotName string; ChatID string
 	} `json:"tg"`
 	YT struct {
-		Connected    bool
-		Working      bool
-		Error        string
-		HasKey       bool
-		HasCookies   bool
-		YtdlpVersion string
+		Connected bool; Working bool; Error string; HasKey bool; HasCookies bool; YtdlpVersion string
 	} `json:"yt"`
 	Jio struct {
-		Connected bool
-		Working   bool
-		Error     string
-		ApiUrl    string
+		Connected bool; Working bool; Error string; ApiUrl string
 	} `json:"jio"`
-	Cookies struct {
-		Exists bool
-		Size   int
-		Valid  bool
-	} `json:"cookies"`
+	Cookies struct{ Exists bool; Size int; Valid bool } `json:"cookies"`
 }
 
 func getConnectionsFast() ConnStatus {
@@ -290,7 +269,6 @@ func (d *DB) save() error {
 	os.WriteFile(tmp, b, 0644)
 	return os.Rename(tmp, cfg.DbPath)
 }
-
 func (d *DB) load() error {
 	if _, err := os.Stat(cfg.DbPath); err != nil {
 		if _, err2 := os.Stat("db.json"); err2 == nil {
@@ -353,7 +331,6 @@ func telegramUploadDB() {
 		defer resp.Body.Close()
 	}
 }
-
 func countCached() int {
 	c := 0
 	db.RLock()
@@ -365,7 +342,6 @@ func countCached() int {
 	db.RUnlock()
 	return c
 }
-
 func telegramDownloadDB() error {
 	if cfg.TelegramToken == "" || cfg.TelegramFileID == "" {
 		return fmt.Errorf("no file_id")
@@ -384,16 +360,21 @@ func telegramDownloadDB() error {
 	}
 	json.NewDecoder(resp.Body).Decode(&r)
 	if r.Result.FilePath == "" {
-		return fmt.Errorf("empty path")
+		return fmt.Errorf("empty path - file_id expired? get new file_id from TG channel")
 	}
 	down := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", cfg.TelegramToken, r.Result.FilePath)
 	resp2, _ := httpClient.Get(down)
+	if resp2 == nil {
+		return fmt.Errorf("download nil")
+	}
 	defer resp2.Body.Close()
 	b, _ := io.ReadAll(resp2.Body)
+	if len(b) < 10 {
+		return fmt.Errorf("db file too small %d bytes", len(b))
+	}
 	os.MkdirAll(filepath.Dir(cfg.DbPath), 0755)
 	return os.WriteFile(cfg.DbPath, b, 0644)
 }
-
 func telegramGetFileUrl(fileID string) (string, error) {
 	if cfg.TelegramToken == "" {
 		return "", fmt.Errorf("no token")
@@ -418,7 +399,6 @@ func telegramGetFileUrl(fileID string) (string, error) {
 	}
 	return fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", cfg.TelegramToken, r.Result.FilePath), nil
 }
-
 func telegramUploadAudioFile(filePathOrUrl string, song *Song) (string, string, error) {
 	if cfg.TelegramToken == "" || cfg.TelegramMusicChatID == "" {
 		return "", "", fmt.Errorf("tg not configured")
@@ -518,7 +498,6 @@ func telegramUploadAudioFile(filePathOrUrl string, song *Song) (string, string, 
 	}
 	return fid, fuid, nil
 }
-
 func cacheSongToTelegram(s *Song, streamUrl string) {
 	if s.TgFileID != "" {
 		return
@@ -543,7 +522,6 @@ func cacheSongToTelegram(s *Song, streamUrl string) {
 	db.save()
 	go telegramUploadDB()
 }
-
 func checkAuth(r *http.Request) (bool, string) {
 	q := r.URL.Query()
 	u := q.Get("u")
@@ -593,41 +571,30 @@ func checkAuth(r *http.Request) (bool, string) {
 	}
 	return false, ""
 }
-
 func writeJSON(w http.ResponseWriter, s int, p interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(s)
 	json.NewEncoder(w).Encode(p)
 }
-
 func subOK(d map[string]interface{}) map[string]interface{} {
 	b := map[string]interface{}{
-		"status":        "ok",
-		"version":       "1.16.1",
-		"type":          "amcfy-compatible",
-		"serverVersion": "5.1-final-panic-raw-fix",
-		"openSubsonic":  true,
+		"status": "ok", "version": "1.16.1", "type": "substreamer-compatible",
+		"serverVersion": "5.2-substreamer-search-fix", "openSubsonic": true,
 	}
 	for k, v := range d {
 		b[k] = v
 	}
 	return map[string]interface{}{"subsonic-response": b}
 }
-
 func subFail(m string, c int) map[string]interface{} {
 	return map[string]interface{}{
 		"subsonic-response": map[string]interface{}{
-			"status":  "failed",
-			"version": "1.16.1",
-			"error": map[string]interface{}{
-				"code":    c,
-				"message": m,
-			},
+			"status": "failed", "version": "1.16.1",
+			"error": map[string]interface{}{"code": c, "message": m},
 		},
 	}
 }
-
 func respond(w http.ResponseWriter, r *http.Request, d map[string]interface{}) {
 	log.Printf("REQ %s %s ?u=%s q=%s UA=%s", r.Method, r.URL.Path, r.URL.Query().Get("u"), r.URL.Query().Get("query"), r.Header.Get("User-Agent"))
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -635,7 +602,6 @@ func respond(w http.ResponseWriter, r *http.Request, d map[string]interface{}) {
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	writeJSON(w, 200, subOK(d))
 }
-
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -648,7 +614,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-
 func slugArtist(n string) string {
 	return "ar_" + url.PathEscape(strings.ToLower(strings.ReplaceAll(strings.TrimSpace(n), " ", "_")))
 }
@@ -735,11 +700,11 @@ func parseJioDownloadUrl(d interface{}) string {
 	return ""
 }
 
+// FIXED searchJio with safe parsing - no panic
 func searchJio(query string) ([]*Song, error) {
-	if query == "" {
+	if strings.TrimSpace(query) == "" {
 		return nil, nil
 	}
-	// Try multiple Jio endpoints for better results
 	endpoints := []string{
 		fmt.Sprintf("%s/search?query=%s", cfg.JioApiUrl, url.QueryEscape(query)),
 		fmt.Sprintf("%s/search/songs?query=%s&limit=40", cfg.JioApiUrl, url.QueryEscape(query)),
@@ -749,14 +714,19 @@ func searchJio(query string) ([]*Song, error) {
 	for _, ep := range endpoints {
 		resp, err := httpClient.Get(ep)
 		if err != nil {
+			log.Printf("JIO endpoint fail %s: %v", ep, err)
 			continue
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if len(body) < 10 {
+			continue
+		}
 		var g map[string]interface{}
-		json.Unmarshal(body, &g)
+		if err := json.Unmarshal(body, &g); err != nil {
+			continue
+		}
 		var raw []interface{}
-		// Parse different response formats
 		if data, ok := g["data"].(map[string]interface{}); ok {
 			if res, ok := data["results"].([]interface{}); ok {
 				raw = res
@@ -774,8 +744,8 @@ func searchJio(query string) ([]*Song, error) {
 			continue
 		}
 		for _, rs := range raw {
-			m, _ := rs.(map[string]interface{})
-			if m == nil {
+			m, ok := rs.(map[string]interface{})
+			if !ok || m == nil {
 				continue
 			}
 			title, _ := m["name"].(string)
@@ -785,12 +755,27 @@ func searchJio(query string) ([]*Song, error) {
 			if title == "" {
 				continue
 			}
-			artist, _ := m["primaryArtists"].(string)
-			if artist == "" {
-				artist = "Various" // fixed panic: safe parse
-				if artist == "" {
-					artist = "Various"
+			// SAFE artist parsing - no panic
+			artist := ""
+			if pa, ok := m["primaryArtists"].(string); ok && pa != "" {
+				artist = pa
+			} else {
+				if artistsField, ok := m["artists"]; ok && artistsField != nil {
+					if artistsMap, ok := artistsField.(map[string]interface{}); ok {
+						if primary, ok := artistsMap["primary"].(string); ok && primary != "" {
+							artist = primary
+						} else if primaryArr, ok := artistsMap["primary"].([]interface{}); ok && len(primaryArr) > 0 {
+							if first, ok := primaryArr[0].(map[string]interface{}); ok {
+								if name, ok := first["name"].(string); ok {
+									artist = name
+								}
+							}
+						}
+					}
 				}
+			}
+			if artist == "" {
+				artist = "Various"
 			}
 			id, _ := m["id"].(string)
 			if id == "" {
@@ -820,12 +805,9 @@ func searchJio(query string) ([]*Song, error) {
 		}
 	}
 	if len(allSongs) > 0 {
-		go func() {
-			db.save()
-			go telegramUploadDB()
-		}()
+		go func() { db.save(); go telegramUploadDB() }()
 	}
-	log.Printf("JIO search '%s' found %d songs", query, len(allSongs))
+	log.Printf("JIO search '%s' -> %d songs", query, len(allSongs))
 	return allSongs, nil
 }
 
@@ -836,7 +818,6 @@ func getJioStream(jioId string) (string, error) {
 			return c.URL, nil
 		}
 	}
-	// Try multiple endpoints
 	endpoints := []string{
 		fmt.Sprintf("%s/songs?id=%s", cfg.JioApiUrl, jioId),
 		fmt.Sprintf("https://saavn.dev/api/songs/%s", jioId),
@@ -850,7 +831,6 @@ func getJioStream(jioId string) (string, error) {
 		resp.Body.Close()
 		var g map[string]interface{}
 		json.Unmarshal(body, &g)
-		// Try to parse downloadUrl from various formats
 		var dlUrl string
 		if data, ok := g["data"].([]interface{}); ok {
 			for _, it := range data {
@@ -884,9 +864,7 @@ type YTSearch struct {
 		Snippet struct {
 			Title        string `json:"title"`
 			ChannelTitle string `json:"channelTitle"`
-			Thumbnails   map[string]struct {
-				URL string `json:"url"`
-			} `json:"thumbnails"`
+			Thumbnails   map[string]struct{ URL string `json:"url"` } `json:"thumbnails"`
 		} `json:"snippet"`
 	} `json:"items"`
 }
@@ -898,7 +876,6 @@ func searchYoutube(q string) ([]*Song, error) {
 	if cfg.YtApiKey == "" {
 		return nil, fmt.Errorf("YT_API_KEY missing")
 	}
-	// Increased maxResults to 40 for more songs
 	u := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=40&q=%s&key=%s", url.QueryEscape(q), cfg.YtApiKey)
 	resp, err := httpClient.Get(u)
 	if err != nil {
@@ -942,11 +919,8 @@ func searchYoutube(q string) ([]*Song, error) {
 		}
 		db.Unlock()
 	}
-	go func() {
-		db.save()
-		go telegramUploadDB()
-	}()
-	log.Printf("YT search '%s' found %d songs", q, len(songs))
+	go func() { db.save(); go telegramUploadDB() }()
+	log.Printf("YT search '%s' -> %d songs", q, len(songs))
 	return songs, nil
 }
 
@@ -965,7 +939,6 @@ func getYoutubeStream(vid string) (string, error) {
 		cookiePath = "/tmp/cookies.txt"
 		os.WriteFile(cookiePath, []byte(cookieContent), 0600)
 	}
-	// Try with cookies first, then without
 	for attempt := 0; attempt < 2; attempt++ {
 		args := []string{"--no-playlist", "--get-url", "-f", "bestaudio[ext=m4a]/bestaudio/best", "https://www.youtube.com/watch?v=" + vid}
 		if attempt == 0 && cookiePath != "" {
@@ -984,16 +957,15 @@ func getYoutubeStream(vid string) (string, error) {
 				for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
 					if strings.HasPrefix(strings.TrimSpace(line), "http") {
 						streamCache.Store("yt_"+vid, cachedURL{URL: strings.TrimSpace(line), Expiry: time.Now().Add(30 * time.Minute)})
-						log.Printf("YT stream OK for %s: %s...", vid, strings.TrimSpace(line)[:50])
 						return strings.TrimSpace(line), nil
 					}
 				}
 			} else {
-				log.Printf("YT attempt %d failed for %s: %v %s", attempt, vid, err, errBuf.String()[:200])
+				log.Printf("YT attempt %d fail %s: %v", attempt, vid, err)
 			}
 		case <-time.After(25 * time.Second):
 			cmd.Process.Kill()
-			log.Printf("YT timeout for %s attempt %d", vid, attempt)
+			log.Printf("YT timeout %s attempt %d", vid, attempt)
 		}
 	}
 	return "", fmt.Errorf("no url after retries")
@@ -1016,7 +988,6 @@ func extractPlaylistID(input string) string {
 	}
 	return input
 }
-
 func importYoutubePlaylist(pid string, owner string) (*Playlist, error) {
 	if cfg.YtApiKey == "" {
 		return nil, fmt.Errorf("YT_API_KEY missing")
@@ -1028,9 +999,7 @@ func importYoutubePlaylist(pid string, owner string) (*Playlist, error) {
 		defer resp.Body.Close()
 		var pr struct {
 			Items []struct {
-				Snippet struct {
-					Title string `json:"title"`
-				} `json:"snippet"`
+				Snippet struct{ Title string `json:"title"` } `json:"snippet"`
 			} `json:"items"`
 		}
 		json.NewDecoder(resp.Body).Decode(&pr)
@@ -1053,14 +1022,10 @@ func importYoutubePlaylist(pid string, owner string) (*Playlist, error) {
 			NextPageToken string `json:"nextPageToken"`
 			Items         []struct {
 				Snippet struct {
-					ResourceID struct {
-						VideoID string `json:"videoId"`
-					} `json:"resourceId"`
+					ResourceID struct{ VideoID string `json:"videoId"` } `json:"resourceId"`
 					Title        string `json:"title"`
 					ChannelTitle string `json:"channelTitle"`
-					Thumbnails   map[string]struct {
-						URL string `json:"url"`
-					} `json:"thumbnails"`
+					Thumbnails   map[string]struct{ URL string `json:"url"` } `json:"thumbnails"`
 				} `json:"snippet"`
 			} `json:"items"`
 		}
@@ -1121,9 +1086,7 @@ func importYoutubePlaylist(pid string, owner string) (*Playlist, error) {
 	return pl, nil
 }
 
-func handlePing(w http.ResponseWriter, r *http.Request) {
-	respond(w, r, map[string]interface{}{})
-}
+func handlePing(w http.ResponseWriter, r *http.Request) { respond(w, r, map[string]interface{}{}) }
 func handleLicense(w http.ResponseWriter, r *http.Request) {
 	respond(w, r, map[string]interface{}{"license": map[string]interface{}{"valid": true}})
 }
@@ -1225,7 +1188,6 @@ func handleGetSong(w http.ResponseWriter, r *http.Request) {
 	respond(w, r, map[string]interface{}{"song": songToSubsonic(s, r)})
 }
 func songToSubsonic(s *Song, r *http.Request) map[string]interface{} {
-	// Add [YT] or [JIO] tag in front of title for AMCFY to show source
 	sourceTag := ""
 	if s.Source == "yt" {
 		sourceTag = "[YT] "
@@ -1254,16 +1216,19 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query().Get("query")
+	if strings.TrimSpace(q) == "" {
+		log.Printf("SEARCH empty query -> returning empty")
+		respond(w, r, map[string]interface{}{"searchResult3": map[string]interface{}{"song": []interface{}{}}})
+		return
+	}
 	sCount, _ := strconv.Atoi(r.URL.Query().Get("songCount"))
 	if sCount == 0 {
 		sCount = 50
 	}
-	// Support infinite scroll via offset
 	offset, _ := strconv.Atoi(r.URL.Query().Get("songOffset"))
 	if offset < 0 {
 		offset = 0
 	}
-	// If count is small, increase for better UX
 	if sCount < 20 {
 		sCount = 50
 	}
@@ -1276,9 +1241,7 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 	go func() { defer wg.Done(); jio, _ = searchJio(q) }()
 	go func() { defer wg.Done(); yt, _ = searchYoutube(q) }()
 	wg.Wait()
-	// Merge JIO first then YT for variety, or interleave
 	all := []*Song{}
-	// Interleave JIO and YT for better mix
 	maxLen := len(jio)
 	if len(yt) > maxLen {
 		maxLen = len(yt)
@@ -1291,7 +1254,6 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 			all = append(all, yt[i])
 		}
 	}
-	// Apply offset for infinite scroll
 	if offset > 0 && offset < len(all) {
 		all = all[offset:]
 	}
@@ -1302,7 +1264,7 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 	for _, s := range all {
 		res = append(res, songToSubsonic(s, r))
 	}
-	log.Printf("SEARCH '%s' -> JIO:%d YT:%d Total:%d Offset:%d Count:%d", q, len(jio), len(yt), len(res), offset, sCount)
+	log.Printf("SEARCH '%s' -> JIO:%d YT:%d Total:%d Offset:%d", q, len(jio), len(yt), len(res), offset)
 	respond(w, r, map[string]interface{}{"searchResult3": map[string]interface{}{"song": res}})
 }
 func handleAlbumList2(w http.ResponseWriter, r *http.Request) {
@@ -1348,49 +1310,49 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", 400)
+		return
+	}
 	db.RLock()
 	s, ok := db.Songs[id]
-	// Debug: list some song IDs if not found
 	if !ok {
-		var sampleIDs []string
-		count := 0
-		for k := range db.Songs {
-			if count < 5 {
-				sampleIDs = append(sampleIDs, k)
-				count++
+		// Try raw ID handling - substreamer sometimes sends raw video ID without prefix
+		for _, tryID := range []string{"yt_" + id, "jio_" + id, id} {
+			if song, ok2 := db.Songs[tryID]; ok2 {
+				s = song
+				ok = true
+				id = tryID
+				break
 			}
 		}
-		log.Printf("STREAM 404: id=%s not found, db has %d songs, sample: %v", id, len(db.Songs), sampleIDs)
-		db.RUnlock()
-			// Try to recover: handle raw IDs like pTJ-bzlM2z0 (YT) or jio IDs without prefix
-		log.Printf("STREAM trying to auto-recreate song for id=%s", id)
+	}
+	db.RUnlock()
+	if !ok {
+		// Auto-recreate for any ID that looks like YT video ID (11 chars) or longer
+		log.Printf("STREAM 404: id=%s not found, db has %d songs - auto-creating", id, len(db.Songs))
 		vid := id
-			source := "yt"
-			if strings.HasPrefix(id, "yt_") {
-				vid = strings.TrimPrefix(id, "yt_")
-				source = "yt"
-			} else if strings.HasPrefix(id, "jio_") {
-				vid = strings.TrimPrefix(id, "jio_")
-				source = "jio"
-			} else if len(id) == 11 || len(id) > 8 {
-				// Likely raw YouTube video ID (11 chars) or Jio ID
-				vid = id
-				source = "yt"
-				// Recreate with proper prefixed ID but also keep original ID for lookup
-				id = "yt_" + vid
-			}
-			s = &Song{
-				ID: id, Title: "YT - " + vid, Artist: "YouTube", Album: "YouTube",
-				Source: source, SourceID: vid, Duration: 210,
-			}
-			db.Lock()
-			db.Songs[id] = s
-			// Also store under original raw ID if different
-			db.Songs[vid] = s
-			db.Unlock()
-			ok = true
-	} else {
-		db.RUnlock()
+		source := "yt"
+		if strings.HasPrefix(id, "yt_") {
+			vid = strings.TrimPrefix(id, "yt_")
+			source = "yt"
+		} else if strings.HasPrefix(id, "jio_") {
+			vid = strings.TrimPrefix(id, "jio_")
+			source = "jio"
+		} else if len(id) == 11 || (len(id) > 8 && !strings.Contains(id, "_")) {
+			vid = id
+			source = "yt"
+			id = "yt_" + vid
+		}
+		s = &Song{
+			ID: id, Title: "YT - " + vid, Artist: "YouTube", Album: "YouTube",
+			Source: source, SourceID: vid, Duration: 210,
+		}
+		db.Lock()
+		db.Songs[id] = s
+		db.Songs[vid] = s
+		db.Unlock()
+		ok = true
 	}
 	db.Lock()
 	if _, ok := db.Songs[id]; ok {
@@ -1410,8 +1372,6 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				log.Printf("STREAM TG HIT for %s", id)
 				io.Copy(w, resp.Body)
 				return
-			} else {
-				log.Printf("STREAM TG fail for %s: %v", id, err)
 			}
 		}
 	}
@@ -1450,7 +1410,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
-		log.Printf("STREAM upstream status %d for %s: %s", resp.StatusCode, id, string(body)[:200])
+		log.Printf("STREAM upstream status %d for %s: %s", resp.StatusCode, id, string(body))
 		http.Error(w, fmt.Sprintf("upstream %d", resp.StatusCode), 502)
 		return
 	}
@@ -1458,7 +1418,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("X-Cache", "MISS")
 	w.Header().Set("Cache-Control", "no-cache")
-	log.Printf("STREAM MISS OK for %s -> %s", id, urlStr[:60])
+	log.Printf("STREAM MISS OK for %s", id)
 	io.Copy(w, resp.Body)
 }
 func handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -1815,12 +1775,10 @@ func handleScrobble(w http.ResponseWriter, r *http.Request) {
 func handleScanStatus(w http.ResponseWriter, r *http.Request) {
 	respond(w, r, map[string]interface{}{"scanStatus": map[string]interface{}{"scanning": false, "count": len(db.Songs)}})
 }
-
 func handleRestCatchAll(w http.ResponseWriter, r *http.Request) {
 	log.Printf("CATCH-ALL REQ: %s %s UA=%s", r.Method, r.URL.Path, r.Header.Get("User-Agent"))
 	respond(w, r, map[string]interface{}{})
 }
-
 func handleConnections(w http.ResponseWriter, r *http.Request) {
 	if ok, _ := checkAuth(r); !ok {
 		writeJSON(w, 200, subFail("auth", 40))
@@ -1861,18 +1819,23 @@ func handleTgIndex(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	cfg = loadConfig()
-	log.Println("=== AMCFY COMPAT v5.1 FINAL - PANIC FIX + RAW ID + DB FIX ===")
+	log.Println("=== SUBSTREAMER v5.2 FINAL - SEARCH FIX + DB 0 FIX + RAW ID ===")
 	log.Printf("YT_API_KEY len=%d cookies size=%d", len(cfg.YtApiKey), len(getCookiesContent()))
 
+	// Try to load DB from file first, then from TG
 	db.load()
+	log.Printf("DB from file: %d songs", len(db.Songs))
 	if len(db.Songs) == 0 && cfg.TelegramFileID != "" {
-		log.Println("Downloading DB from TG...")
+		log.Println("DB empty, trying download from TG...")
 		if err := telegramDownloadDB(); err != nil {
-			log.Printf("DB download failed: %v", err)
+			log.Printf("DB download failed: %v (file_id expired? create new backup via /health endpoint)", err)
 		} else {
 			db.load()
-			log.Printf("DB restored songs: %d (file_id may be expired if 0)" , len(db.Songs))
+			log.Printf("DB restored from TG: %d songs", len(db.Songs))
 		}
+	}
+	if len(db.Songs) == 0 {
+		log.Println("WARNING: DB still 0 songs - search will still work via YT/JIO APIs, but library empty. Import playlist via /rest/importYoutubePlaylist.view")
 	}
 	os.MkdirAll(filepath.Dir(cfg.DbPath), 0755)
 	initUsers()
@@ -1901,6 +1864,8 @@ func main() {
 	mux.HandleFunc("/rest/getSong", handleGetSong)
 	mux.HandleFunc("/rest/search3.view", handleSearch3)
 	mux.HandleFunc("/rest/search3", handleSearch3)
+	mux.HandleFunc("/rest/search2.view", handleSearch3)
+	mux.HandleFunc("/rest/search2", handleSearch3)
 	mux.HandleFunc("/rest/getAlbumList.view", handleAlbumList2)
 	mux.HandleFunc("/rest/getAlbumList", handleAlbumList2)
 	mux.HandleFunc("/rest/getAlbumList2.view", handleAlbumList2)
@@ -2015,12 +1980,8 @@ func main() {
 		db.RUnlock()
 		status := getConnectionsFast()
 		writeJSON(w, 200, map[string]interface{}{
-			"status":      "ok",
-			"songs":       songsCount,
-			"playlists":   plsCount,
-			"users":       usersCount,
-			"cached":      cached,
-			"connections": status,
+			"status": "ok", "songs": songsCount, "playlists": plsCount, "users": usersCount, "cached": cached, "connections": status,
+			"note": "If songs=0, DB file_id expired. Re-import playlist via /rest/importYoutubePlaylist.view?url=PLAYLIST_URL",
 		})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -2031,7 +1992,7 @@ func main() {
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprint(w, "<html><body style='background:#000;color:#fff;font-family:monospace;padding:20px'><h2>Koyeb API v5.0 FINAL</h2><p>[YT]/[JIO] tag + 50 songs + playback 404 fix + infinite scroll support</p></body></html>")
+		fmt.Fprint(w, "<html><body style='background:#000;color:#fff;font-family:monospace;padding:20px'><h2>Koyeb API v5.2 Substreamer</h2><p>SEARCH FIX + DB 0 FIX + RAW ID support<br><br>Search test: /rest/search3.view?u=admin&p=admin2330&v=1.16.1&c=substreamer&f=json&query=kesariya<br><br>If DB 0, import: /rest/importYoutubePlaylist.view?u=admin&p=admin2330&v=1.16.1&c=substreamer&f=json&url=YT_PLAYLIST_URL</p></body></html>")
 	})
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -2044,6 +2005,6 @@ func main() {
 	if !strings.HasPrefix(port, ":") {
 		port = ":" + port
 	}
-	log.Printf("Starting AMCFY v5.0 FINAL on %s", port)
+	log.Printf("Starting SUBSTREAMER v5.2 FINAL on %s", port)
 	log.Fatal(http.ListenAndServe(port, corsMiddleware(mux)))
 }
