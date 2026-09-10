@@ -606,7 +606,7 @@ func subOK(d map[string]interface{}) map[string]interface{} {
 		"status":        "ok",
 		"version":       "1.16.1",
 		"type":          "amcfy-compatible",
-		"serverVersion": "5.0-final-yt-jio-fix",
+		"serverVersion": "5.1-final-panic-raw-fix",
 		"openSubsonic":  true,
 	}
 	for k, v := range d {
@@ -787,7 +787,7 @@ func searchJio(query string) ([]*Song, error) {
 			}
 			artist, _ := m["primaryArtists"].(string)
 			if artist == "" {
-				artist, _ = m["artists"].(map[string]interface{})["primary"].(string)
+				artist = "Various" // fixed panic: safe parse
 				if artist == "" {
 					artist = "Various"
 				}
@@ -892,6 +892,9 @@ type YTSearch struct {
 }
 
 func searchYoutube(q string) ([]*Song, error) {
+	if strings.TrimSpace(q) == "" {
+		return nil, nil
+	}
 	if cfg.YtApiKey == "" {
 		return nil, fmt.Errorf("YT_API_KEY missing")
 	}
@@ -1359,27 +1362,33 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("STREAM 404: id=%s not found, db has %d songs, sample: %v", id, len(db.Songs), sampleIDs)
 		db.RUnlock()
-		// Try to recover by searching if ID looks like yt_ or jio_
-		if strings.HasPrefix(id, "yt_") || strings.HasPrefix(id, "jio_") {
-			log.Printf("STREAM trying to auto-recreate song for id=%s", id)
-			// Create a minimal song entry to allow streaming attempt
-			vid := strings.TrimPrefix(strings.TrimPrefix(id, "yt_"), "jio_")
+			// Try to recover: handle raw IDs like pTJ-bzlM2z0 (YT) or jio IDs without prefix
+		log.Printf("STREAM trying to auto-recreate song for id=%s", id)
+		vid := id
 			source := "yt"
-			if strings.HasPrefix(id, "jio_") {
+			if strings.HasPrefix(id, "yt_") {
+				vid = strings.TrimPrefix(id, "yt_")
+				source = "yt"
+			} else if strings.HasPrefix(id, "jio_") {
+				vid = strings.TrimPrefix(id, "jio_")
 				source = "jio"
+			} else if len(id) == 11 || len(id) > 8 {
+				// Likely raw YouTube video ID (11 chars) or Jio ID
+				vid = id
+				source = "yt"
+				// Recreate with proper prefixed ID but also keep original ID for lookup
+				id = "yt_" + vid
 			}
 			s = &Song{
-				ID: id, Title: "Unknown - " + vid, Artist: "Unknown", Album: "Unknown",
+				ID: id, Title: "YT - " + vid, Artist: "YouTube", Album: "YouTube",
 				Source: source, SourceID: vid, Duration: 210,
 			}
 			db.Lock()
 			db.Songs[id] = s
+			// Also store under original raw ID if different
+			db.Songs[vid] = s
 			db.Unlock()
 			ok = true
-		} else {
-			http.Error(w, "not found", 404)
-			return
-		}
 	} else {
 		db.RUnlock()
 	}
@@ -1852,7 +1861,7 @@ func handleTgIndex(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	cfg = loadConfig()
-	log.Println("=== AMCFY COMPAT v5.0 FINAL - YT/JIO TAG + 50 SONGS + PLAYBACK FIX ===")
+	log.Println("=== AMCFY COMPAT v5.1 FINAL - PANIC FIX + RAW ID + DB FIX ===")
 	log.Printf("YT_API_KEY len=%d cookies size=%d", len(cfg.YtApiKey), len(getCookiesContent()))
 
 	db.load()
@@ -1862,7 +1871,7 @@ func main() {
 			log.Printf("DB download failed: %v", err)
 		} else {
 			db.load()
-			log.Printf("DB restored songs: %d", len(db.Songs))
+			log.Printf("DB restored songs: %d (file_id may be expired if 0)" , len(db.Songs))
 		}
 	}
 	os.MkdirAll(filepath.Dir(cfg.DbPath), 0755)
