@@ -1217,12 +1217,12 @@ func searchAudius(q string) ([]*Song, error) {
 	}
 	var parsed struct {
 		Data []struct {
-			ID          string `json:"id"`
-			Title       string `json:"title"`
-			Duration    int    `json:"duration"`
-			Permalink   string `json:"permalink"`
-			Artwork     map[string]string `json:"artwork"`
-			User        struct {
+			ID        string          `json:"id"`
+			Title     string          `json:"title"`
+			Duration  int             `json:"duration"`
+			Permalink string          `json:"permalink"`
+			Artwork   json.RawMessage `json:"artwork"`
+			User      struct {
 				Name string `json:"name"`
 			} `json:"user"`
 		} `json:"data"`
@@ -1240,8 +1240,13 @@ func searchAudius(q string) ([]*Song, error) {
 			artist = "Audius"
 		}
 		thumb := ""
+		// artwork can be map[string]string OR array — handle both
+		var artMap map[string]string
+		if len(it.Artwork) > 0 && it.Artwork[0] == '{' {
+			_ = json.Unmarshal(it.Artwork, &artMap)
+		}
 		for _, k := range []string{"480x480", "150x150", "1000x1000"} {
-			if u, ok := it.Artwork[k]; ok && u != "" {
+			if u, ok := artMap[k]; ok && u != "" {
 				thumb = u
 				break
 			}
@@ -1719,13 +1724,30 @@ func songToSubsonic(s *Song, r *http.Request) map[string]interface{} {
 	if duration <= 0 {
 		duration = 210
 	}
+	// Fields aligned with Subsonic Child / OpenSubsonic for Substreamer SDK
 	m := map[string]interface{}{
-		"id": s.ID, "parent": s.AlbumID, "title": sourceTag + s.Title,
-		"artist": s.Artist, "album": s.Album, "albumId": s.AlbumID, "artistId": s.ArtistID,
-		"coverArt": s.CoverArt, "duration": duration, "bitRate": 128,
-		"contentType": "audio/mp4", "suffix": "m4a", "isDir": false, "type": "music",
-		"genre": s.Source, "path": s.Source + "/" + s.ID + ".m4a",
-		"playCount": s.PlayCount, "created": time.Now().Format(time.RFC3339),
+		"id":          s.ID,
+		"parent":      s.AlbumID,
+		"title":       sourceTag + s.Title,
+		"artist":      s.Artist,
+		"album":       s.Album,
+		"albumId":     s.AlbumID,
+		"artistId":    s.ArtistID,
+		"coverArt":    s.CoverArt,
+		"duration":    duration,
+		"bitRate":     128,
+		"size":        duration * 16000, // approximate bytes
+		"contentType": "audio/mp4",
+		"suffix":      "m4a",
+		"isDir":       false,
+		"isVideo":     false,
+		"type":        "music",
+		"genre":       s.Source,
+		"path":        s.Source + "/" + s.ID + ".m4a",
+		"playCount":   s.PlayCount,
+		"created":     time.Now().UTC().Format(time.RFC3339),
+		"track":       1,
+		"year":        time.Now().Year(),
 	}
 	if s.TgFileID != "" {
 		m["comment"] = "cached"
@@ -1800,32 +1822,52 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 	if offset < 0 {
 		offset = 0
 	}
+	// Substreamer guardedServerSearch timeout = 5s — must finish under ~4s.
+	type srcResult struct {
+		name  string
+		songs []*Song
+		err   error
+	}
+	ch := make(chan srcResult, 4)
+	go func() { s, e := searchJio(q); ch <- srcResult{"jio", s, e} }()
+	go func() { s, e := searchDeezer(q); ch <- srcResult{"deezer", s, e} }()
+	go func() { s, e := searchAudius(q); ch <- srcResult{"audius", s, e} }()
+	go func() { s, e := searchYoutube(q); ch <- srcResult{"yt", s, e} }()
+
 	var jio, yt, audius, deezer []*Song
-	var errJ, errY, errA, errD error
-	var wg sync.WaitGroup
-	wg.Add(4)
-	go func() { defer wg.Done(); jio, errJ = searchJio(q) }()
-	go func() { defer wg.Done(); yt, errY = searchYoutube(q) }()
-	go func() { defer wg.Done(); audius, errA = searchAudius(q) }()
-	go func() { defer wg.Done(); deezer, errD = searchDeezer(q) }()
-	wg.Wait()
-	if errJ != nil {
-		log.Printf("searchJio err: %v", errJ)
-	}
-	if errY != nil {
-		log.Printf("searchYoutube err: %v", errY)
-	}
-	if errA != nil {
-		log.Printf("searchAudius err: %v", errA)
-	}
-	if errD != nil {
-		log.Printf("searchDeezer err: %v", errD)
+	deadline := time.After(3800 * time.Millisecond)
+	got := 0
+collect:
+	for got < 4 {
+		select {
+		case r := <-ch:
+			got++
+			if r.err != nil {
+				log.Printf("search %s err: %v", r.name, r.err)
+			}
+			switch r.name {
+			case "jio":
+				jio = r.songs
+			case "yt":
+				yt = r.songs
+			case "audius":
+				audius = r.songs
+			case "deezer":
+				deezer = r.songs
+			}
+			// Early exit once fast sources filled enough results
+			if got >= 2 && (len(jio)+len(deezer) >= 10 || len(jio)+len(deezer)+len(audius)+len(yt) >= sCount) {
+				break collect
+			}
+		case <-deadline:
+			log.Printf("SEARCH deadline hit for '%s' (got %d/4 sources)", q, got)
+			break collect
+		}
 	}
 
-	// Interleave sources for variety: Jio, YT, Audius, Deezer
 	all := []*Song{}
 	maxLen := len(jio)
-	for _, L := range []int{len(yt), len(audius), len(deezer)} {
+	for _, L := range []int{len(deezer), len(audius), len(yt)} {
 		if L > maxLen {
 			maxLen = L
 		}
@@ -1834,14 +1876,14 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 		if i < len(jio) {
 			all = append(all, jio[i])
 		}
-		if i < len(yt) {
-			all = append(all, yt[i])
+		if i < len(deezer) {
+			all = append(all, deezer[i])
 		}
 		if i < len(audius) {
 			all = append(all, audius[i])
 		}
-		if i < len(deezer) {
-			all = append(all, deezer[i])
+		if i < len(yt) {
+			all = append(all, yt[i])
 		}
 	}
 	if offset > 0 {
@@ -1855,16 +1897,32 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 		all = all[:sCount]
 	}
 	res := make([]map[string]interface{}, 0, len(all))
+	albums := make([]map[string]interface{}, 0)
+	artists := make([]map[string]interface{}, 0)
+	seenAlbum := map[string]bool{}
+	seenArtist := map[string]bool{}
 	for _, s := range all {
 		res = append(res, songToSubsonic(s, r))
+		if s.AlbumID != "" && !seenAlbum[s.AlbumID] {
+			seenAlbum[s.AlbumID] = true
+			albums = append(albums, map[string]interface{}{
+				"id": s.AlbumID, "name": s.Album, "artist": s.Artist, "artistId": s.ArtistID,
+				"coverArt": s.CoverArt, "songCount": 1,
+			})
+		}
+		if s.ArtistID != "" && !seenArtist[s.ArtistID] {
+			seenArtist[s.ArtistID] = true
+			artists = append(artists, map[string]interface{}{
+				"id": s.ArtistID, "name": s.Artist, "albumCount": 1,
+			})
+		}
 	}
-	log.Printf("SEARCH '%s' -> JIO:%d YT:%d Audius:%d Deezer:%d Total:%d", q, len(jio), len(yt), len(audius), len(deezer), len(res))
-	// Always use empty slices (never null) — Substreamer breaks on null
+	log.Printf("SEARCH '%s' -> JIO:%d YT:%d Audius:%d Deezer:%d Total:%d (sources=%d)", q, len(jio), len(yt), len(audius), len(deezer), len(res), got)
 	respond(w, r, map[string]interface{}{
 		"searchResult3": map[string]interface{}{
 			"song":   res,
-			"album":  []map[string]interface{}{},
-			"artist": []map[string]interface{}{},
+			"album":  albums,
+			"artist": artists,
 		},
 	})
 }
