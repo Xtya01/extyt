@@ -78,41 +78,119 @@ var cfg Config
 var usersMap = map[string]string{}
 var muUsers sync.RWMutex
 
-func getCookiesContent() string {
-	if b64 := getEnvAny([]string{"YT_COOKIES_B64", "YOUTUBE_COOKIES_B64"}, ""); strings.TrimSpace(b64) != "" {
-		trimmed := strings.TrimSpace(b64)
-		if d, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
-			s := string(d)
-			if strings.Contains(s, "Netscape") || strings.Contains(s, "youtube.com") || len(s) > 100 {
-				return s
-			}
-		}
-		if d, err := base64.RawStdEncoding.DecodeString(trimmed); err == nil {
-			s := string(d)
-			if len(s) > 100 {
-				return s
-			}
-		}
-		if strings.Contains(trimmed, "Netscape") {
-			return trimmed
-		}
-		return trimmed
+// Runtime overrides — update via /admin without Koyeb redeploy
+var (
+	runtimeMu       sync.RWMutex
+	runtimeCookies  string // raw Netscape cookie file content
+	runtimeYtApiKey string
+	runtimeJioURL   string
+)
+
+func cookiesFilePath() string {
+	dir := filepath.Dir(cfg.DbPath)
+	if dir == "" || dir == "." {
+		dir = "/tmp"
 	}
-	raw := getEnvAny([]string{"YT_COOKIES", "YOUTUBE_COOKIES"}, "")
-	if raw == "" {
+	return filepath.Join(dir, "yt_cookies.txt")
+}
+
+func decodeCookieBlob(trimmed string) string {
+	trimmed = strings.TrimSpace(trimmed)
+	if trimmed == "" {
 		return ""
 	}
-	trimmed := strings.TrimSpace(raw)
-	if strings.Contains(trimmed, "Netscape") {
+	if strings.Contains(trimmed, "Netscape") || strings.Contains(trimmed, ".youtube.com") {
 		return trimmed
 	}
 	if d, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
 		s := string(d)
-		if strings.Contains(s, "Netscape") {
+		if strings.Contains(s, "Netscape") || strings.Contains(s, "youtube.com") || len(s) > 100 {
+			return s
+		}
+	}
+	if d, err := base64.RawStdEncoding.DecodeString(trimmed); err == nil {
+		s := string(d)
+		if len(s) > 100 {
 			return s
 		}
 	}
 	return trimmed
+}
+
+func getCookiesContent() string {
+	runtimeMu.RLock()
+	if runtimeCookies != "" {
+		c := runtimeCookies
+		runtimeMu.RUnlock()
+		return c
+	}
+	runtimeMu.RUnlock()
+
+	// Persistent file (survives process if volume mounted)
+	if b, err := os.ReadFile(cookiesFilePath()); err == nil && len(b) > 50 {
+		return string(b)
+	}
+	if b, err := os.ReadFile("/tmp/yt_cookies.txt"); err == nil && len(b) > 50 {
+		return string(b)
+	}
+
+	if b64 := getEnvAny([]string{"YT_COOKIES_B64", "YOUTUBE_COOKIES_B64"}, ""); strings.TrimSpace(b64) != "" {
+		return decodeCookieBlob(b64)
+	}
+	raw := getEnvAny([]string{"YT_COOKIES", "YOUTUBE_COOKIES"}, "")
+	return decodeCookieBlob(raw)
+}
+
+// setRuntimeCookies updates in-memory + disk cookies immediately (no redeploy).
+func setRuntimeCookies(rawOrB64 string) error {
+	content := decodeCookieBlob(rawOrB64)
+	if content == "" || len(content) < 50 {
+		return fmt.Errorf("cookies too short or empty")
+	}
+	if !strings.Contains(content, "youtube.com") && !strings.Contains(content, "Netscape") {
+		return fmt.Errorf("does not look like YouTube Netscape cookies")
+	}
+	runtimeMu.Lock()
+	runtimeCookies = content
+	runtimeMu.Unlock()
+	// clear stream cache so next play re-resolves with new cookies
+	streamCache = sync.Map{}
+	_ = os.MkdirAll(filepath.Dir(cookiesFilePath()), 0755)
+	_ = os.WriteFile(cookiesFilePath(), []byte(content), 0600)
+	_ = os.WriteFile("/tmp/yt_cookies.txt", []byte(content), 0600)
+	_ = os.WriteFile("/tmp/cookies.txt", []byte(content), 0600)
+	log.Printf("YT cookies updated runtime size=%d path=%s", len(content), cookiesFilePath())
+	return nil
+}
+
+func getEffectiveYtKey() string {
+	runtimeMu.RLock()
+	defer runtimeMu.RUnlock()
+	if runtimeYtApiKey != "" {
+		return runtimeYtApiKey
+	}
+	return cfg.YtApiKey
+}
+
+func getEffectiveJioURL() string {
+	runtimeMu.RLock()
+	defer runtimeMu.RUnlock()
+	if runtimeJioURL != "" {
+		return strings.TrimSuffix(runtimeJioURL, "/")
+	}
+	return cfg.JioApiUrl
+}
+
+func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	user, ok := requireAuth(w, r)
+	if !ok {
+		return false
+	}
+	if user != cfg.SubUser {
+		writeJSON(w, 200, subFail("admin only", 50))
+		return false
+	}
+	return true
 }
 
 func initUsers() {
@@ -261,10 +339,10 @@ func getConnectionsFast() ConnStatus {
 	} else {
 		status.TG.Error = "BOT_TOKEN missing"
 	}
-	status.YT.HasKey = cfg.YtApiKey != ""
-	status.YT.Connected = cfg.YtApiKey != ""
-	status.YT.Working = cfg.YtApiKey != ""
-	if cfg.YtApiKey == "" {
+	status.YT.HasKey = getEffectiveYtKey() != ""
+	status.YT.Connected = getEffectiveYtKey() != ""
+	status.YT.Working = getEffectiveYtKey() != ""
+	if getEffectiveYtKey() == "" {
 		status.YT.Error = "YT_API_KEY missing"
 	}
 	cc := getCookiesContent()
@@ -274,9 +352,9 @@ func getConnectionsFast() ConnStatus {
 		status.Cookies.Size = len(cc)
 		status.Cookies.Valid = true
 	}
-	status.Jio.ApiUrl = cfg.JioApiUrl
-	status.Jio.Connected = cfg.JioApiUrl != ""
-	status.Jio.Working = cfg.JioApiUrl != ""
+	status.Jio.ApiUrl = getEffectiveJioURL()
+	status.Jio.Connected = getEffectiveJioURL() != ""
+	status.Jio.Working = getEffectiveJioURL() != ""
 	cmd := exec.Command("yt-dlp", "--version")
 	out, _ := cmd.CombinedOutput()
 	status.YT.YtdlpVersion = strings.TrimSpace(string(out))
@@ -851,7 +929,7 @@ func searchJio(query string) ([]*Song, error) {
 		return nil, nil
 	}
 	endpoints := []string{
-		fmt.Sprintf("%s/search?query=%s", strings.TrimRight(cfg.JioApiUrl, "/"), url.QueryEscape(query)),
+		fmt.Sprintf("%s/search?query=%s", getEffectiveJioURL(), url.QueryEscape(query)),
 		fmt.Sprintf("https://saavn.sumit.co/api/search/songs?query=%s", url.QueryEscape(query)),
 	}
 	var allSongs []*Song
@@ -1018,7 +1096,7 @@ func getJioStream(jioId string) (string, error) {
 	// saavn.sumit.co returns clear downloadUrl with 320kbps
 	endpoints := []string{
 		fmt.Sprintf("https://saavn.sumit.co/api/songs/%s", jioId),
-		fmt.Sprintf("%s/songs?id=%s", strings.TrimRight(cfg.JioApiUrl, "/"), jioId),
+		fmt.Sprintf("%s/songs?id=%s", getEffectiveJioURL(), jioId),
 	}
 	for _, ep := range endpoints {
 		resp, err := httpClient.Get(ep)
@@ -1094,10 +1172,10 @@ func searchYoutube(q string) ([]*Song, error) {
 	if strings.TrimSpace(q) == "" {
 		return nil, nil
 	}
-	if cfg.YtApiKey == "" {
+	if getEffectiveYtKey() == "" {
 		return nil, fmt.Errorf("YT_API_KEY missing")
 	}
-	u := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=40&q=%s&key=%s", url.QueryEscape(q), cfg.YtApiKey)
+	u := fmt.Sprintf("https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=40&q=%s&key=%s", url.QueryEscape(q), getEffectiveYtKey())
 	resp, err := httpClient.Get(u)
 	if err != nil {
 		return nil, err
@@ -1167,14 +1245,26 @@ func getYoutubeStream(vid string) (string, error) {
 	cookieContent := getCookiesContent()
 	cookiePath := ""
 	if cookieContent != "" {
-		cookiePath = "/tmp/cookies.txt"
-		_ = os.WriteFile(cookiePath, []byte(cookieContent), 0600)
-	}
-	for attempt := 0; attempt < 2; attempt++ {
-		args := []string{"--no-playlist", "--get-url", "-f", "bestaudio[ext=m4a]/bestaudio/best", "https://www.youtube.com/watch?v=" + vid}
-		if attempt == 0 && cookiePath != "" {
-			args = append([]string{"--cookies", cookiePath}, args...)
+		cookiePath = "/tmp/yt_cookies.txt"
+		if err := os.WriteFile(cookiePath, []byte(cookieContent), 0600); err != nil {
+			log.Printf("YT cookies write fail: %v", err)
+			cookiePath = ""
 		}
+	}
+	// Try android/ios clients first — less bot-check than web
+	attempts := [][]string{
+		{"--extractor-args", "youtube:player_client=android", "-f", "bestaudio/best"},
+		{"--extractor-args", "youtube:player_client=ios", "-f", "bestaudio/best"},
+		{"--extractor-args", "youtube:player_client=tv_embedded", "-f", "bestaudio[ext=m4a]/bestaudio/best"},
+		{"-f", "bestaudio[ext=m4a]/bestaudio/best"},
+	}
+	for i, extra := range attempts {
+		args := []string{"--no-playlist", "--no-warnings", "--get-url"}
+		args = append(args, extra...)
+		if cookiePath != "" {
+			args = append(args, "--cookies", cookiePath)
+		}
+		args = append(args, "https://www.youtube.com/watch?v="+vid)
 		cmd := exec.Command("yt-dlp", args...)
 		var out bytes.Buffer
 		var errBuf bytes.Buffer
@@ -1182,27 +1272,38 @@ func getYoutubeStream(vid string) (string, error) {
 		cmd.Stderr = &errBuf
 		done := make(chan error, 1)
 		go func() { done <- cmd.Run() }()
+		var err error
 		select {
-		case err := <-done:
-			if err == nil {
-				for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
-					line = strings.TrimSpace(line)
-					if strings.HasPrefix(line, "http") {
-						streamCache.Store("yt_"+vid, cachedURL{URL: line, Expiry: time.Now().Add(30 * time.Minute)})
-						return line, nil
-					}
-				}
-			} else {
-				log.Printf("YT attempt %d fail %s: %v stderr=%s", attempt, vid, err, errBuf.String())
-			}
-		case <-time.After(25 * time.Second):
+		case err = <-done:
+		case <-time.After(20 * time.Second):
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
 			}
-			log.Printf("YT timeout %s attempt %d", vid, attempt)
+			log.Printf("YT timeout %s attempt %d", vid, i)
+			continue
+		}
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "http") {
+					streamCache.Store("yt_"+vid, cachedURL{URL: line, Expiry: time.Now().Add(25 * time.Minute)})
+					log.Printf("YT OK %s via attempt %d", vid, i)
+					return line, nil
+				}
+			}
+		} else {
+			stderr := errBuf.String()
+			if len(stderr) > 400 {
+				stderr = stderr[:400]
+			}
+			log.Printf("YT attempt %d fail %s: %v stderr=%s", i, vid, err, stderr)
+			// Bot check / login required → no point trying more web clients without fresh cookies
+			if strings.Contains(errBuf.String(), "Sign in to confirm") || strings.Contains(errBuf.String(), "not a bot") {
+				return "", fmt.Errorf("youtube bot-check: refresh YT_COOKIES_B64 (export fresh cookies from browser)")
+			}
 		}
 	}
-	return "", fmt.Errorf("no url after retries")
+	return "", fmt.Errorf("no url after retries (cookies expired or yt-dlp blocked)")
 }
 
 // ---------- Audius (full free streams, no API key) ----------
@@ -1465,12 +1566,12 @@ func extractPlaylistID(input string) string {
 }
 
 func importYoutubePlaylist(pid string, owner string) (*Playlist, error) {
-	if cfg.YtApiKey == "" {
+	if getEffectiveYtKey() == "" {
 		return nil, fmt.Errorf("YT_API_KEY missing")
 	}
 	pid = extractPlaylistID(pid)
 	title := pid
-	infoURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/playlists?part=snippet&id=%s&key=%s", pid, cfg.YtApiKey)
+	infoURL := fmt.Sprintf("https://www.googleapis.com/youtube/v3/playlists?part=snippet&id=%s&key=%s", pid, getEffectiveYtKey())
 	if resp, err := httpClient.Get(infoURL); err == nil {
 		defer resp.Body.Close()
 		var pr struct {
@@ -1488,7 +1589,7 @@ func importYoutubePlaylist(pid string, owner string) (*Playlist, error) {
 	var allIDs []string
 	pageToken := ""
 	for {
-		apiUrl := fmt.Sprintf("https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId=%s&key=%s", pid, cfg.YtApiKey)
+		apiUrl := fmt.Sprintf("https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId=%s&key=%s", pid, getEffectiveYtKey())
 		if pageToken != "" {
 			apiUrl += "&pageToken=" + pageToken
 		}
@@ -3260,6 +3361,142 @@ func handleTgIndex(w http.ResponseWriter, r *http.Request) {
 	respond(w, r, map[string]interface{}{"tgIndex": list, "total": len(list), "cached": countCached()})
 }
 
+
+func handleAdminUI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprint(w, `<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Substreamer Admin</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0b0b0f;color:#eee;max-width:720px;margin:24px auto;padding:0 16px}
+h1{font-size:1.3rem} label{display:block;margin:12px 0 4px;color:#aaa;font-size:.85rem}
+input,textarea{width:100%;box-sizing:border-box;background:#1a1a22;border:1px solid #333;color:#fff;padding:10px;border-radius:8px}
+textarea{min-height:160px;font-family:monospace;font-size:12px}
+button{margin-top:12px;background:#3b82f6;color:#fff;border:0;padding:12px 18px;border-radius:8px;font-weight:600;cursor:pointer}
+button.secondary{background:#333}
+.card{background:#14141c;border:1px solid #2a2a35;border-radius:12px;padding:16px;margin:16px 0}
+.ok{color:#4ade80}.err{color:#f87171} .muted{color:#888;font-size:.85rem}
+code{background:#222;padding:2px 6px;border-radius:4px}
+</style></head><body>
+<h1>Substreamer Admin</h1>
+<p class="muted">Runtime config — <b>no Koyeb redeploy</b>. Use Subsonic admin user.</p>
+<div class="card">
+<label>Admin user</label><input id="u" value="admin"/>
+<label>Password</label><input id="p" type="password" placeholder="SUBSONIC_PASSWORD"/>
+</div>
+<div class="card">
+<h3>YouTube cookies</h3>
+<p class="muted">Paste Netscape <code>cookies.txt</code> OR base64. Applied instantly.</p>
+<textarea id="cookies" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com ..."></textarea>
+<button onclick="saveCookies()">Save cookies (live)</button>
+<button class="secondary" onclick="status()">Refresh status</button>
+<pre id="out" class="muted"></pre>
+</div>
+<div class="card">
+<h3>Optional keys</h3>
+<label>YT API key</label><input id="ytkey" placeholder="leave blank = keep current"/>
+<label>Jio API URL</label><input id="jiourl" placeholder="leave blank = keep current"/>
+<button onclick="saveKeys()">Save keys</button>
+</div>
+<script>
+function qs(){return "u="+encodeURIComponent(document.getElementById("u").value)+"&p="+encodeURIComponent(document.getElementById("p").value);}
+async function saveCookies(){
+  var out=document.getElementById("out");
+  out.textContent="saving...";
+  var r=await fetch("/admin/api/cookies?"+qs(),{method:"POST",headers:{"Content-Type":"text/plain"},body:document.getElementById("cookies").value});
+  var j=await r.json(); out.className=j.ok?"ok":"err"; out.textContent=JSON.stringify(j,null,2);
+}
+async function saveKeys(){
+  var out=document.getElementById("out");
+  out.textContent="saving...";
+  var body={yt_api_key:document.getElementById("ytkey").value,jio_api_url:document.getElementById("jiourl").value};
+  var r=await fetch("/admin/api/keys?"+qs(),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  var j=await r.json(); out.className=j.ok?"ok":"err"; out.textContent=JSON.stringify(j,null,2);
+}
+async function status(){
+  var out=document.getElementById("out");
+  var r=await fetch("/admin/api/status?"+qs());
+  var j=await r.json(); out.className=j.ok?"ok":"err"; out.textContent=JSON.stringify(j,null,2);
+}
+</script>
+</body></html>`)
+}
+
+func handleAdminCookies(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(204)
+		return
+	}
+	if !requireAdmin(w, r) {
+		return
+	}
+	if r.Method != "POST" {
+		writeJSON(w, 405, map[string]interface{}{"ok": false, "error": "POST only"})
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	if err := setRuntimeCookies(string(body)); err != nil {
+		writeJSON(w, 200, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": true, "size": len(getCookiesContent()),
+		"note": "cookies live — no redeploy needed",
+	})
+}
+
+func handleAdminKeys(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(204)
+		return
+	}
+	if !requireAdmin(w, r) {
+		return
+	}
+	if r.Method != "POST" {
+		writeJSON(w, 405, map[string]interface{}{"ok": false, "error": "POST only"})
+		return
+	}
+	var body struct {
+		YtApiKey  string `json:"yt_api_key"`
+		JioApiURL string `json:"jio_api_url"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	runtimeMu.Lock()
+	if strings.TrimSpace(body.YtApiKey) != "" {
+		runtimeYtApiKey = strings.TrimSpace(body.YtApiKey)
+	}
+	if strings.TrimSpace(body.JioApiURL) != "" {
+		runtimeJioURL = strings.TrimSpace(body.JioApiURL)
+	}
+	runtimeMu.Unlock()
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": true,
+		"yt_key_len": len(getEffectiveYtKey()),
+		"jio_url": getEffectiveJioURL(),
+	})
+}
+
+func handleAdminStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if !requireAdmin(w, r) {
+		return
+	}
+	cc := getCookiesContent()
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": true,
+		"cookies_size": len(cc),
+		"cookies_has_youtube": strings.Contains(cc, "youtube.com"),
+		"cookies_has_login": strings.Contains(cc, "LOGIN_INFO") || strings.Contains(cc, "SID"),
+		"yt_key_len": len(getEffectiveYtKey()),
+		"jio_url": getEffectiveJioURL(),
+		"songs": len(db.Songs),
+	})
+}
+
 func register(mux *http.ServeMux, path string, h http.HandlerFunc) {
 	mux.HandleFunc(path+".view", h)
 	mux.HandleFunc(path, h)
@@ -3268,7 +3505,7 @@ func register(mux *http.ServeMux, path string, h http.HandlerFunc) {
 func main() {
 	cfg = loadConfig()
 	log.Println("=== SUBSTREAMER-COMPATIBLE API v5.3 REPAIRED ===")
-	log.Printf("YT_API_KEY len=%d cookies size=%d", len(cfg.YtApiKey), len(getCookiesContent()))
+	log.Printf("YT_API_KEY len=%d cookies size=%d", len(getEffectiveYtKey()), len(getCookiesContent()))
 
 	if err := db.load(); err != nil {
 		log.Printf("DB load: %v", err)
@@ -3293,6 +3530,12 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/admin", handleAdminUI)
+	mux.HandleFunc("/admin/", handleAdminUI)
+	mux.HandleFunc("/admin/api/cookies", handleAdminCookies)
+	mux.HandleFunc("/admin/api/keys", handleAdminKeys)
+	mux.HandleFunc("/admin/api/status", handleAdminStatus)
+
 
 	register(mux, "/rest/ping", handlePing)
 	register(mux, "/rest/getLicense", handleLicense)
