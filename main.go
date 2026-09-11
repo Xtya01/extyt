@@ -594,15 +594,28 @@ func cacheSongToTelegram(s *Song, streamUrl string) {
 	go telegramUploadDB()
 }
 
-func checkAuth(r *http.Request) (bool, string) {
-	q := r.URL.Query()
-	u := q.Get("u")
-	if u == "" {
-		u = q.Get("username")
+// param reads query string first, then POST form (OpenSubsonic formPost).
+func param(r *http.Request, key string) string {
+	if v := r.URL.Query().Get(key); v != "" {
+		return v
 	}
-	p := q.Get("p")
-	t := q.Get("t")
-	s := q.Get("s")
+	if r.Method == "POST" || r.Method == "PUT" {
+		_ = r.ParseForm()
+		if v := r.FormValue(key); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func checkAuth(r *http.Request) (bool, string) {
+	u := param(r, "u")
+	if u == "" {
+		u = param(r, "username")
+	}
+	p := param(r, "p")
+	t := param(r, "t")
+	s := param(r, "s")
 
 	// OpenSubsonic: getOpenSubsonicExtensions should be public
 	if strings.Contains(r.URL.Path, "getOpenSubsonicExtensions") {
@@ -729,7 +742,8 @@ func slugArtist(n string) string {
 	if n == "" {
 		n = "Unknown"
 	}
-	return "ar_" + url.PathEscape(strings.ToLower(strings.ReplaceAll(n, " ", "_")))
+	h := md5.Sum([]byte(strings.ToLower(n)))
+	return "ar_" + hex.EncodeToString(h[:12])
 }
 
 func slugAlbum(n, a string) string {
@@ -738,7 +752,9 @@ func slugAlbum(n, a string) string {
 	if n == "" {
 		n = "Unknown"
 	}
-	return "al_" + url.PathEscape(strings.ToLower(strings.ReplaceAll(a+"_"+n, " ", "_")))
+	// Stable hex id — no spaces/% encoding (Substreamer breaks on PathEscape ids)
+	h := md5.Sum([]byte(strings.ToLower(a + "|" + n)))
+	return "al_" + hex.EncodeToString(h[:12])
 }
 
 func ensureArtist(n string) *Artist {
@@ -1640,24 +1656,51 @@ func handleGetArtist(w http.ResponseWriter, r *http.Request) {
 	if _, ok := requireAuth(w, r); !ok {
 		return
 	}
-	id := r.URL.Query().Get("id")
+	id := param(r, "id")
 	db.RLock()
 	a, ok := db.Artists[id]
+	// Rebuild from songs if artist map missed (or old PathEscape id)
+	if !ok {
+		for _, s := range db.Songs {
+			if s.ArtistID == id {
+				a = &Artist{ID: id, Name: s.Artist}
+				ok = true
+				break
+			}
+		}
+	}
 	if !ok {
 		db.RUnlock()
 		writeJSON(w, 200, subFail("Artist not found", 70))
 		return
 	}
-	var albums []map[string]interface{}
+	albumMap := map[string]map[string]interface{}{}
 	for _, al := range db.Albums {
 		if al.ArtistID == id {
-			albums = append(albums, map[string]interface{}{
+			albumMap[al.ID] = map[string]interface{}{
 				"id": al.ID, "name": al.Name, "songCount": len(al.SongIDs),
 				"coverArt": al.ID, "artist": al.Artist, "artistId": al.ArtistID,
-			})
+				"duration": 0,
+			}
+		}
+	}
+	// Also collect albums referenced only via songs
+	for _, s := range db.Songs {
+		if s.ArtistID == id && s.AlbumID != "" {
+			if _, exists := albumMap[s.AlbumID]; !exists {
+				albumMap[s.AlbumID] = map[string]interface{}{
+					"id": s.AlbumID, "name": s.Album, "songCount": 1,
+					"coverArt": s.CoverArt, "artist": s.Artist, "artistId": s.ArtistID,
+					"duration": s.Duration,
+				}
+			}
 		}
 	}
 	db.RUnlock()
+	albums := make([]map[string]interface{}, 0, len(albumMap))
+	for _, v := range albumMap {
+		albums = append(albums, v)
+	}
 	respond(w, r, map[string]interface{}{"artist": map[string]interface{}{"id": a.ID, "name": a.Name, "album": albums, "albumCount": len(albums)}})
 }
 
@@ -1665,30 +1708,73 @@ func handleGetAlbum(w http.ResponseWriter, r *http.Request) {
 	if _, ok := requireAuth(w, r); !ok {
 		return
 	}
-	id := r.URL.Query().Get("id")
+	id := param(r, "id")
 	db.RLock()
 	al, ok := db.Albums[id]
 	if !ok {
 		if s, ok2 := db.Songs[id]; ok2 {
 			al, ok = db.Albums[s.AlbumID]
+			if !ok {
+				// synthesize album from song
+				al = &Album{ID: s.AlbumID, Name: s.Album, Artist: s.Artist, ArtistID: s.ArtistID, CoverArt: s.CoverArt, SongIDs: []string{s.ID}}
+				ok = true
+			}
 		}
 	}
-	if !ok {
+	// Fallback: collect any songs with this albumId
+	var songs []map[string]interface{}
+	totalDur := 0
+	if ok && al != nil {
+		seen := map[string]bool{}
+		for _, sid := range al.SongIDs {
+			if s, found := db.Songs[sid]; found {
+				songs = append(songs, songToSubsonic(s, r))
+				totalDur += s.Duration
+				seen[sid] = true
+			}
+		}
+		for _, s := range db.Songs {
+			if s.AlbumID == al.ID && !seen[s.ID] {
+				songs = append(songs, songToSubsonic(s, r))
+				totalDur += s.Duration
+			}
+		}
+	} else {
+		// Last resort: match by album id on songs only
+		var name, artist, artistId, cover string
+		for _, s := range db.Songs {
+			if s.AlbumID == id {
+				songs = append(songs, songToSubsonic(s, r))
+				totalDur += s.Duration
+				name, artist, artistId, cover = s.Album, s.Artist, s.ArtistID, s.CoverArt
+			}
+		}
+		if len(songs) == 0 {
+			db.RUnlock()
+			log.Printf("getAlbum NOT FOUND id=%s (albums=%d songs=%d)", id, len(db.Albums), len(db.Songs))
+			writeJSON(w, 200, subFail("Album not found", 70))
+			return
+		}
 		db.RUnlock()
-		writeJSON(w, 200, subFail("Album not found", 70))
+		respond(w, r, map[string]interface{}{
+			"album": map[string]interface{}{
+				"id": id, "name": name, "artist": artist, "artistId": artistId,
+				"coverArt": cover, "song": songs, "songCount": len(songs),
+				"duration": totalDur, "year": time.Now().Year(),
+			},
+		})
 		return
 	}
-	var songs []map[string]interface{}
-	for _, sid := range al.SongIDs {
-		if s, ok := db.Songs[sid]; ok {
-			songs = append(songs, songToSubsonic(s, r))
-		}
-	}
+	name, artist, artistId, cover := al.Name, al.Artist, al.ArtistID, al.CoverArt
 	db.RUnlock()
+	if len(songs) == 0 {
+		log.Printf("getAlbum empty songs id=%s", id)
+	}
 	respond(w, r, map[string]interface{}{
 		"album": map[string]interface{}{
-			"id": al.ID, "name": al.Name, "artist": al.Artist, "artistId": al.ArtistID,
-			"coverArt": al.ID, "song": songs, "songCount": len(songs),
+			"id": al.ID, "name": name, "artist": artist, "artistId": artistId,
+			"coverArt": cover, "song": songs, "songCount": len(songs),
+			"duration": totalDur, "year": time.Now().Year(),
 		},
 	})
 }
@@ -1734,9 +1820,9 @@ func songToSubsonic(s *Song, r *http.Request) map[string]interface{} {
 		"albumId":     s.AlbumID,
 		"artistId":    s.ArtistID,
 		"coverArt":    s.CoverArt,
-		"duration":    duration,
+		"duration":    duration, // integer seconds — never omit (client shows NaNd otherwise)
 		"bitRate":     128,
-		"size":        duration * 16000, // approximate bytes
+		"size":        duration * 16000,
 		"contentType": "audio/mp4",
 		"suffix":      "m4a",
 		"isDir":       false,
@@ -1747,7 +1833,8 @@ func songToSubsonic(s *Song, r *http.Request) map[string]interface{} {
 		"playCount":   s.PlayCount,
 		"created":     time.Now().UTC().Format(time.RFC3339),
 		"track":       1,
-		"year":        time.Now().Year(),
+		"year":        2024,
+		"discNumber":  1,
 	}
 	if s.TgFileID != "" {
 		m["comment"] = "cached"
@@ -1759,14 +1846,15 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 	if _, ok := requireAuth(w, r); !ok {
 		return
 	}
-	q := r.URL.Query().Get("query")
+	q := param(r, "query")
+	log.Printf("SEARCH3 start query=%q client=%s", q, param(r, "c"))
 	if strings.TrimSpace(q) == "" {
 		// Empty query: return local library page (Substreamer library sync path)
-		sCount, _ := strconv.Atoi(r.URL.Query().Get("songCount"))
-		aCount, _ := strconv.Atoi(r.URL.Query().Get("albumCount"))
-		arCount, _ := strconv.Atoi(r.URL.Query().Get("artistCount"))
-		sOff, _ := strconv.Atoi(r.URL.Query().Get("songOffset"))
-		aOff, _ := strconv.Atoi(r.URL.Query().Get("albumOffset"))
+		sCount, _ := strconv.Atoi(param(r, "songCount"))
+		aCount, _ := strconv.Atoi(param(r, "albumCount"))
+		arCount, _ := strconv.Atoi(param(r, "artistCount"))
+		sOff, _ := strconv.Atoi(param(r, "songOffset"))
+		aOff, _ := strconv.Atoi(param(r, "albumOffset"))
 		if sCount == 0 && aCount == 0 && arCount == 0 {
 			respond(w, r, map[string]interface{}{"searchResult3": map[string]interface{}{
 				"song": []interface{}{}, "album": []interface{}{}, "artist": []interface{}{},
@@ -1811,14 +1899,15 @@ func handleSearch3(w http.ResponseWriter, r *http.Request) {
 		}})
 		return
 	}
-	sCount, _ := strconv.Atoi(r.URL.Query().Get("songCount"))
+	sCount, _ := strconv.Atoi(param(r, "songCount"))
 	if sCount <= 0 {
-		sCount = 50
-	}
-	if sCount > 100 {
 		sCount = 100
 	}
-	offset, _ := strconv.Atoi(r.URL.Query().Get("songOffset"))
+	// High cap for long result lists / "infinite" paging
+	if sCount > 500 {
+		sCount = 500
+	}
+	offset, _ := strconv.Atoi(param(r, "songOffset"))
 	if offset < 0 {
 		offset = 0
 	}
@@ -1901,20 +1990,39 @@ collect:
 	artists := make([]map[string]interface{}, 0)
 	seenAlbum := map[string]bool{}
 	seenArtist := map[string]bool{}
+	albumDur := map[string]int{}
+	albumTracks := map[string]int{}
 	for _, s := range all {
 		res = append(res, songToSubsonic(s, r))
-		if s.AlbumID != "" && !seenAlbum[s.AlbumID] {
-			seenAlbum[s.AlbumID] = true
-			albums = append(albums, map[string]interface{}{
-				"id": s.AlbumID, "name": s.Album, "artist": s.Artist, "artistId": s.ArtistID,
-				"coverArt": s.CoverArt, "songCount": 1,
-			})
+		if s.AlbumID != "" {
+			albumDur[s.AlbumID] += s.Duration
+			albumTracks[s.AlbumID]++
+			if !seenAlbum[s.AlbumID] {
+				seenAlbum[s.AlbumID] = true
+				albums = append(albums, map[string]interface{}{
+					"id": s.AlbumID, "name": s.Album, "artist": s.Artist, "artistId": s.ArtistID,
+					"coverArt": s.CoverArt, "songCount": 1,
+					"duration": s.Duration, "year": time.Now().Year(),
+				})
+			}
 		}
 		if s.ArtistID != "" && !seenArtist[s.ArtistID] {
 			seenArtist[s.ArtistID] = true
 			artists = append(artists, map[string]interface{}{
 				"id": s.ArtistID, "name": s.Artist, "albumCount": 1,
 			})
+		}
+	}
+	// Fix album songCount + duration after full pass (avoid NaNd in client)
+	for i := range albums {
+		aid, _ := albums[i]["id"].(string)
+		if n := albumTracks[aid]; n > 0 {
+			albums[i]["songCount"] = n
+		}
+		if d := albumDur[aid]; d > 0 {
+			albums[i]["duration"] = d
+		} else {
+			albums[i]["duration"] = 210
 		}
 	}
 	log.Printf("SEARCH '%s' -> JIO:%d YT:%d Audius:%d Deezer:%d Total:%d (sources=%d)", q, len(jio), len(yt), len(audius), len(deezer), len(res), got)
@@ -2007,109 +2115,147 @@ func findSongByID(id string) (*Song, string) {
 	return nil, id
 }
 
+func resolveStreamSong(id string) *Song {
+	s, _ := findSongByID(id)
+	if s != nil {
+		return s
+	}
+	// Auto-create from id prefix so play works even after pod restart
+	vid := id
+	source := "yt"
+	switch {
+	case strings.HasPrefix(id, "yt_"):
+		vid = strings.TrimPrefix(id, "yt_")
+		source = "yt"
+	case strings.HasPrefix(id, "jio_"):
+		vid = strings.TrimPrefix(id, "jio_")
+		source = "jio"
+	case strings.HasPrefix(id, "audius_"):
+		vid = strings.TrimPrefix(id, "audius_")
+		source = "audius"
+	case strings.HasPrefix(id, "deezer_"):
+		vid = strings.TrimPrefix(id, "deezer_")
+		source = "deezer"
+	case len(id) >= 10 && !strings.Contains(id, "_"):
+		vid = id
+		source = "yt"
+		id = "yt_" + vid
+	default:
+		log.Printf("STREAM unknown id shape: %s", id)
+		return nil
+	}
+	label := map[string]string{"yt": "YouTube", "jio": "JioSaavn", "audius": "Audius", "deezer": "Deezer"}[source]
+	art := ensureArtist(label)
+	al := ensureAlbum(label, label, art.ID, "")
+	s = &Song{
+		ID: id, Title: "Track " + vid, Artist: label, ArtistID: art.ID,
+		Album: al.Name, AlbumID: al.ID, CoverArt: al.ID,
+		Source: source, SourceID: vid, Duration: 210,
+	}
+	db.Lock()
+	db.Songs[id] = s
+	db.Unlock()
+	log.Printf("STREAM auto-created %s source=%s sid=%s", id, source, vid)
+	return s
+}
+
 func handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	log.Printf("STREAM REQ id=%s u=%s", r.URL.Query().Get("id"), r.URL.Query().Get("u"))
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length, Content-Type")
+	id := param(r, "id")
+	log.Printf("STREAM REQ id=%s u=%s range=%v", id, param(r, "u"), r.Header.Get("Range") != "")
 	if _, ok := requireAuth(w, r); !ok {
 		return
 	}
-	id := r.URL.Query().Get("id")
 	if id == "" {
 		http.Error(w, "missing id", 400)
 		return
 	}
-	s, resolvedID := findSongByID(id)
-	id = resolvedID
+	s := resolveStreamSong(id)
 	if s == nil {
-		log.Printf("STREAM 404: id=%s not found, auto-creating", id)
-		vid := id
-		source := "yt"
-		if strings.HasPrefix(id, "yt_") {
-			vid = strings.TrimPrefix(id, "yt_")
-			source = "yt"
-		} else if strings.HasPrefix(id, "jio_") {
-			vid = strings.TrimPrefix(id, "jio_")
-			source = "jio"
-		} else if len(id) >= 10 && !strings.Contains(id, "_") {
-			vid = id
-			source = "yt"
-			id = "yt_" + vid
-		}
-		art := ensureArtist("YouTube")
-		al := ensureAlbum("YouTube", "YouTube", art.ID, "")
-		s = &Song{
-			ID: id, Title: "Track " + vid, Artist: "YouTube", ArtistID: art.ID,
-			Album: al.Name, AlbumID: al.ID, CoverArt: al.ID,
-			Source: source, SourceID: vid, Duration: 210,
-		}
-		db.Lock()
-		db.Songs[id] = s
-		db.Unlock()
+		http.Error(w, "song not found", 404)
+		return
 	}
+	id = s.ID
 	db.Lock()
 	if song, ok := db.Songs[id]; ok {
 		song.PlayCount++
 	}
 	db.Unlock()
 
-	// Prefer Telegram cache (with Range support)
+	// Prefer Telegram cache
 	if s.TgFileID != "" {
 		if tgUrl, err := telegramGetFileUrl(s.TgFileID); err == nil {
 			if proxyAudioWithRange(w, r, tgUrl, "TG") {
 				log.Printf("STREAM TG HIT %s", id)
 				return
 			}
+			log.Printf("STREAM TG miss/fail %s, falling through", id)
 		}
 	}
 
-	var urlStr string
-	var err error
-	switch s.Source {
-	case "jio":
-		urlStr, err = getJioStream(s.SourceID)
-		if (err != nil || urlStr == "") && s.StreamURL != "" {
-			urlStr = s.StreamURL
-			err = nil
-		}
-		if urlStr == "" {
-			log.Printf("STREAM JIO no url for %s: %v", id, err)
-			http.Error(w, "jio stream fail", 502)
-			return
-		}
-	case "audius":
-		urlStr, err = getAudiusStream(s.SourceID)
-		if err != nil || urlStr == "" {
-			log.Printf("STREAM Audius fail for %s: %v", id, err)
-			http.Error(w, "audius stream fail", 502)
-			return
-		}
-	case "deezer":
-		urlStr, err = getDeezerStream(s.SourceID, s.StreamURL)
-		if err != nil || urlStr == "" {
-			log.Printf("STREAM Deezer fail for %s: %v", id, err)
-			http.Error(w, "deezer preview fail", 502)
-			return
-		}
-	default: // yt
-		urlStr, err = getYoutubeStream(s.SourceID)
-		if err != nil || urlStr == "" {
-			log.Printf("STREAM YT fail for %s: %v", id, err)
-			msg := "yt stream fail"
-			if err != nil {
-				msg += ": " + err.Error()
-			}
-			http.Error(w, msg, 502)
-			return
-		}
+	urlStr, err := resolvePlayURL(s)
+	if err != nil || urlStr == "" {
+		log.Printf("STREAM resolve fail id=%s source=%s: %v", id, s.Source, err)
+		http.Error(w, "stream unavailable", 502)
+		return
 	}
-	if s.TgFileID == "" && (s.Source == "yt" || s.Source == "audius") {
+	if s.TgFileID == "" && (s.Source == "yt" || s.Source == "audius" || s.Source == "jio") {
 		go cacheSongToTelegram(s, urlStr)
 	}
 	if proxyAudioWithRange(w, r, urlStr, "MISS") {
-		log.Printf("STREAM MISS OK %s range=%v", id, r.Header.Get("Range") != "")
+		log.Printf("STREAM OK id=%s source=%s range=%v", id, s.Source, r.Header.Get("Range") != "")
 		return
 	}
+	log.Printf("STREAM proxy fail id=%s url=%s", id, urlStr[:min(80, len(urlStr))])
 	http.Error(w, "upstream fail", 502)
+}
+
+func resolvePlayURL(s *Song) (string, error) {
+	if s.StreamURL != "" && (s.Source == "deezer" || s.Source == "jio") {
+		// Prefer cached direct URL when present
+		if s.Source == "deezer" {
+			return s.StreamURL, nil
+		}
+	}
+	switch s.Source {
+	case "jio":
+		u, err := getJioStream(s.SourceID)
+		if (err != nil || u == "") && s.StreamURL != "" {
+			return s.StreamURL, nil
+		}
+		return u, err
+	case "audius":
+		return getAudiusStream(s.SourceID)
+	case "deezer":
+		return getDeezerStream(s.SourceID, s.StreamURL)
+	default:
+		return getYoutubeStream(s.SourceID)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// streamHTTPClient: no overall Timeout (would kill long songs mid-play).
+// Only header wait is limited.
+var streamHTTPClient = &http.Client{
+	Timeout: 0,
+	Transport: &http.Transport{
+		ResponseHeaderTimeout: 25 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          32,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 8 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	},
 }
 
 // proxyAudioWithRange forwards client Range headers to upstream and returns 206 when applicable.
@@ -2118,15 +2264,22 @@ func proxyAudioWithRange(w http.ResponseWriter, r *http.Request, urlStr, cacheTa
 	if err != nil {
 		return false
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	// Help CDNs that check referrer
+	if strings.Contains(urlStr, "saavncdn") || strings.Contains(urlStr, "jiosaavn") {
+		req.Header.Set("Referer", "https://www.jiosaavn.com/")
+	}
+	if strings.Contains(urlStr, "googlevideo") || strings.Contains(urlStr, "youtube") {
+		req.Header.Set("Referer", "https://www.youtube.com/")
+	}
 	if rng := r.Header.Get("Range"); rng != "" {
 		req.Header.Set("Range", rng)
 	}
 	if ir := r.Header.Get("If-Range"); ir != "" {
 		req.Header.Set("If-Range", ir)
 	}
-	client := &http.Client{Timeout: 45 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := streamHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("proxy upstream fail: %v", err)
 		return false
@@ -2144,20 +2297,20 @@ func proxyAudioWithRange(w http.ResponseWriter, r *http.Request, urlStr, cacheTa
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length, Content-Type")
 	w.Header().Set("X-Cache", cacheTag)
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
 		w.Header().Set("Content-Length", cl)
 	}
 	if cr := resp.Header.Get("Content-Range"); cr != "" {
 		w.Header().Set("Content-Range", cr)
 	}
-	if ar := resp.Header.Get("Accept-Ranges"); ar != "" {
-		w.Header().Set("Accept-Ranges", ar)
+	w.WriteHeader(resp.StatusCode)
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("proxy copy client disconnect or err: %v", err)
 	}
-	w.WriteHeader(resp.StatusCode) // 200 or 206
-	_, _ = io.Copy(w, resp.Body)
 	return true
 }
 
@@ -2166,8 +2319,8 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	if _, ok := requireAuth(w, r); !ok {
 		return
 	}
-	id := r.URL.Query().Get("id")
-	s, id := findSongByID(id)
+	id := param(r, "id")
+	s := resolveStreamSong(id)
 	if s == nil {
 		http.Error(w, "not found", 404)
 		return
@@ -2180,25 +2333,19 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if urlStr == "" {
 		var err error
-		switch s.Source {
-		case "jio":
-			urlStr, _ = getJioStream(s.SourceID)
-			if urlStr == "" {
-				urlStr = s.StreamURL
-			}
-		case "audius":
-			urlStr, err = getAudiusStream(s.SourceID)
-		case "deezer":
-			urlStr, err = getDeezerStream(s.SourceID, s.StreamURL)
-		default:
-			urlStr, err = getYoutubeStream(s.SourceID)
-		}
+		urlStr, err = resolvePlayURL(s)
 		if err != nil || urlStr == "" {
 			http.Error(w, "stream fail", 502)
 			return
 		}
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s - %s.m4a\"", s.Artist, s.Title))
+	safeName := strings.Map(func(r rune) rune {
+		if r == '"' || r == '/' || r == '\\' {
+			return '-'
+		}
+		return r
+	}, s.Artist+" - "+s.Title)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.m4a\"", safeName))
 	if !proxyAudioWithRange(w, r, urlStr, "DL") {
 		http.Error(w, "upstream", 502)
 	}
